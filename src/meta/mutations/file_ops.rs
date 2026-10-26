@@ -397,13 +397,126 @@ pub fn execute_library_move_impl(source: &Path, destination: &Path) -> Result<()
     Ok(())
 }
 
+/// Maximum bytes for a single filename component (ext4/NAME_MAX).
+const STASH_FILENAME_MAX_BYTES: usize = 255;
+
+/// Cap on stash-slot uniquifying attempts.
+///
+/// Reaching this does not mean "we ran out of names" — the `_N` suffix has
+/// effectively unlimited room. It means something upstream is re-creating the
+/// source path on every cycle (deploy/leftover flapping), and the stash is the
+/// symptom rather than the problem. Fail loudly instead of stat(2)-ing forever.
+const STASH_UNIQUIFY_MAX_ATTEMPTS: usize = 1000;
+
+/// Return true if `a` and `b` resolve to the same inode. False if either
+/// path can't be stat'd or the inodes differ.
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.ino() == mb.ino() && ma.dev() == mb.dev(),
+        _ => false,
+    }
+}
+
+/// Pick the stash path to rename `source` onto: `preferred` if free, otherwise
+/// `stem_2.ext`, `stem_3.ext`, … until a free name is found.
+///
+/// Returns `Ok(None)` when `preferred` *is* `source` — the file already occupies its
+/// own stash slot, so there is nothing to vacate.
+///
+/// A candidate that exists but shares `source`'s inode is skipped, not accepted as a
+/// no-op. Deploy hardlinks corpus files into the library, so a library link and a
+/// stash entry routinely share an inode; the data being preserved already is not a
+/// reason to leave the source link in place. Every caller stashes precisely to free
+/// the source path, and reporting success without freeing it deadlocks the deploy
+/// pipeline — the DeployLink waiting on that library slot fails with "Destination
+/// already exists (different inode)" on every cycle, forever. The extra stash entries
+/// this creates are directory entries against an existing inode: no storage cost, and
+/// nothing is ever unlinked.
+///
+/// The suffix counts rather than repeats: an earlier unary scheme (`track_.flac`,
+/// `track__.flac`, …) grew the filename by a byte per collision, so a slot that had
+/// flapped a couple hundred times hit NAME_MAX and could never be vacated again.
+fn resolve_stash_destination(source: &Path, preferred: PathBuf) -> Result<Option<PathBuf>> {
+    if !preferred.exists() {
+        return Ok(Some(preferred));
+    }
+    if preferred == source {
+        return Ok(None);
+    }
+
+    let mut same_inode_collisions = usize::from(same_inode(source, &preferred));
+
+    let parent = preferred.parent().map(PathBuf::from);
+    let stem = preferred
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    let extension = preferred.extension().map(|e| e.to_os_string());
+    let dot_ext_len = extension.as_ref().map(|e| e.len() + 1).unwrap_or(0);
+
+    for n in 2..=STASH_UNIQUIFY_MAX_ATTEMPTS {
+        let suffix = format!("_{}", n);
+        if stem.len() + suffix.len() + dot_ext_len > STASH_FILENAME_MAX_BYTES {
+            return Err(anyhow::anyhow!(
+                "Cannot uniquify stash filename for {}: NAME_MAX ({} bytes) exceeded at \
+                 suffix {} in {}",
+                source.display(),
+                STASH_FILENAME_MAX_BYTES,
+                suffix,
+                parent.map(|p| p.display().to_string()).unwrap_or_default(),
+            ));
+        }
+
+        let mut filename = stem.clone();
+        filename.push(&suffix);
+        if let Some(ref ext) = extension {
+            filename.push(".");
+            filename.push(ext);
+        }
+        let dest = match &parent {
+            Some(p) => p.join(&filename),
+            None => PathBuf::from(&filename),
+        };
+
+        if !dest.exists() {
+            if same_inode_collisions > 0 {
+                crate::logging::log_general(format!(
+                    "[STASH] {} already has {} stash entr{} sharing its inode; \
+                     vacating the source link to {}",
+                    source.display(),
+                    same_inode_collisions,
+                    if same_inode_collisions == 1 { "y" } else { "ies" },
+                    dest.display(),
+                ));
+            }
+            return Ok(Some(dest));
+        }
+        if dest == source {
+            return Ok(None);
+        }
+        if same_inode(source, &dest) {
+            same_inode_collisions += 1;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Cannot uniquify stash filename for {}: {} occupied slots in {}. \
+         Something is re-creating this path every cycle — fix the deploy/leftover \
+         flapping upstream rather than the stash.",
+        source.display(),
+        STASH_UNIQUIFY_MAX_ATTEMPTS,
+        parent.map(|p| p.display().to_string()).unwrap_or_default(),
+    ))
+}
+
 /// Move a file to the stash directory, preserving corpus/library directory structure.
 ///
 /// Destination: `{stash_root}/{stash_name}/{relative_path}`
 /// where `relative_path` is the path within corpus/ or libraries/, preserving structure.
 ///
-/// If the destination already exists, appends underscores to the filename stem until
-/// a unique path is found (e.g., `track.flac` -> `track_.flac` -> `track__.flac`).
+/// Destination selection (underscore uniquifying, same-inode handling, NAME_MAX
+/// bound) lives in `resolve_stash_destination`. On success `path` is always vacated.
 ///
 /// Examples:
 /// - `/archive/corpus/Artist/Album/track.flac` -> `stash/overlaps/Artist/Album/track.flac`
@@ -434,40 +547,19 @@ pub fn execute_move_to_stash(path: &Path, stash_name: &str, stash_root: &Path) -
 
     // Build destination: stash_root/stash_name/preserved_path
     let stash_base = stash_root.join(stash_name);
-    let mut dest = stash_base.join(preserved_path);
+    let preferred = stash_base.join(preserved_path);
 
     // Create destination directory if needed
-    if let Some(parent) = dest.parent() {
+    if let Some(parent) = preferred.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create stash directory: {}", parent.display()))?;
     }
 
-    // If destination exists, append underscores to stem until unique
-    if dest.exists() {
-        let parent = dest.parent().map(PathBuf::from);
-        let stem = dest
-            .file_stem()
-            .map(|s| s.to_os_string())
-            .unwrap_or_default();
-        let extension = dest.extension().map(|e| e.to_os_string());
-
-        let mut new_stem = stem;
-        loop {
-            new_stem.push("_");
-            let mut new_filename = new_stem.clone();
-            if let Some(ref ext) = extension {
-                new_filename.push(".");
-                new_filename.push(ext);
-            }
-            dest = match &parent {
-                Some(p) => p.join(&new_filename),
-                None => PathBuf::from(&new_filename),
-            };
-            if !dest.exists() {
-                break;
-            }
-        }
-    }
+    let dest = match resolve_stash_destination(path, preferred)? {
+        Some(dest) => dest,
+        // Source already occupies its own stash slot — nothing to vacate.
+        None => return Ok(()),
+    };
 
     move_file(path, &dest).with_context(|| {
         format!(
@@ -528,5 +620,162 @@ mod tests {
         });
 
         assert!(matches!(mutation, Mutation::HardLink(_)));
+    }
+
+    /// A free stash slot is used as-is.
+    #[test]
+    fn stash_destination_uses_free_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        fs::write(&source, b"audio").unwrap();
+        let preferred = dir.path().join("stash").join("track.flac");
+        fs::create_dir_all(preferred.parent().unwrap()).unwrap();
+
+        let dest = resolve_stash_destination(&source, preferred.clone()).unwrap();
+
+        assert_eq!(dest, Some(preferred));
+    }
+
+    /// An occupied slot holding a *different* file uniquifies with underscores.
+    #[test]
+    fn stash_destination_uniquifies_past_unrelated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        fs::write(&source, b"audio").unwrap();
+        let preferred = dir.path().join("stash").join("track.flac");
+        fs::create_dir_all(preferred.parent().unwrap()).unwrap();
+        fs::write(&preferred, b"someone else").unwrap();
+
+        let dest = resolve_stash_destination(&source, preferred).unwrap();
+
+        assert_eq!(dest, Some(dir.path().join("stash").join("track_2.flac")));
+    }
+
+    /// Regression: a stash entry hardlinked to the source must NOT short-circuit to
+    /// a no-op. The caller stashes to vacate the source path; returning the existing
+    /// entry (or None) leaves the source link in place and deadlocks the deploy
+    /// pipeline on "Destination already exists (different inode)".
+    #[test]
+    fn stash_destination_skips_past_same_inode_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        fs::write(&source, b"audio").unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+        let preferred = stash.join("track.flac");
+        // Same inode as source — the file's data is already stashed.
+        fs::hard_link(&source, &preferred).unwrap();
+
+        let dest = resolve_stash_destination(&source, preferred).unwrap();
+
+        assert_eq!(dest, Some(stash.join("track_2.flac")));
+        assert!(
+            !dest.unwrap().exists(),
+            "chosen destination must be a free path"
+        );
+    }
+
+    /// Repeated same-inode entries keep uniquifying rather than giving up.
+    #[test]
+    fn stash_destination_skips_past_multiple_same_inode_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        fs::write(&source, b"audio").unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+        let preferred = stash.join("track.flac");
+        fs::hard_link(&source, &preferred).unwrap();
+        fs::hard_link(&source, stash.join("track_2.flac")).unwrap();
+        fs::hard_link(&source, stash.join("track_3.flac")).unwrap();
+
+        let dest = resolve_stash_destination(&source, preferred).unwrap();
+
+        assert_eq!(dest, Some(stash.join("track_4.flac")));
+    }
+
+    /// Regression: the counting suffix keeps filenames short where the old unary
+    /// scheme grew a byte per collision and eventually wedged the slot at NAME_MAX.
+    /// This is the shape found in prod — a cover that had flapped 247 times.
+    #[test]
+    fn stash_destination_survives_hundreds_of_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cover.jpg");
+        fs::write(&source, b"image").unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+        let preferred = stash.join("cover.jpg");
+        fs::hard_link(&source, &preferred).unwrap();
+        for n in 2..250 {
+            fs::hard_link(&source, stash.join(format!("cover_{}.jpg", n))).unwrap();
+        }
+
+        let dest = resolve_stash_destination(&source, preferred).unwrap().unwrap();
+
+        assert_eq!(dest, stash.join("cover_250.jpg"));
+        assert!(
+            dest.file_name().unwrap().len() < 20,
+            "filename must not grow with collision count: {:?}",
+            dest.file_name()
+        );
+    }
+
+    /// A pathologically contended slot fails loudly instead of stat'ing forever.
+    #[test]
+    fn stash_destination_errors_past_attempt_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cover.jpg");
+        fs::write(&source, b"image").unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+        let preferred = stash.join("cover.jpg");
+        fs::hard_link(&source, &preferred).unwrap();
+        for n in 2..=STASH_UNIQUIFY_MAX_ATTEMPTS {
+            fs::hard_link(&source, stash.join(format!("cover_{}.jpg", n))).unwrap();
+        }
+
+        let err = resolve_stash_destination(&source, preferred).unwrap_err();
+
+        assert!(
+            err.to_string().contains("flapping"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// A source that already sits at its own stash slot has nothing to vacate.
+    #[test]
+    fn stash_destination_noop_when_source_is_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+        let source = stash.join("track.flac");
+        fs::write(&source, b"audio").unwrap();
+
+        let dest = resolve_stash_destination(&source, source.clone()).unwrap();
+
+        assert_eq!(dest, None);
+    }
+
+    /// The underscore loop is bounded by NAME_MAX instead of spinning forever.
+    #[test]
+    fn stash_destination_errors_past_name_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.flac");
+        fs::write(&source, b"audio").unwrap();
+        let stash = dir.path().join("stash");
+        fs::create_dir_all(&stash).unwrap();
+
+        // Stem already at NAME_MAX minus the extension: the first suffix overflows.
+        let stem = "x".repeat(STASH_FILENAME_MAX_BYTES - ".flac".len());
+        let preferred = stash.join(format!("{}.flac", stem));
+        fs::write(&preferred, b"someone else").unwrap();
+
+        let err = resolve_stash_destination(&source, preferred).unwrap_err();
+
+        assert!(
+            err.to_string().contains("NAME_MAX"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

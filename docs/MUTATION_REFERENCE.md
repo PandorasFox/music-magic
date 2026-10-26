@@ -311,6 +311,24 @@ Soft mutations execute in two phases with a drain barrier:
 1. **Cleanup** (`DeployMove` + `StashLibrary`) — clear destination paths
 2. **Deploy** (`DeployLink`) — hard-link into cleared paths
 
+The barrier only helps if Cleanup actually vacates the path. `execute_move_to_stash`
+therefore **always** renames its source away, even when an existing stash entry
+already shares the source's inode — deploy hardlinks corpus files into the library,
+so a library link and a stash entry sharing an inode is the normal case, not proof
+the slot is free. Treating it as "already stashed" and returning success leaves the
+occupant in place, and the paired `DeployLink` in the Deploy phase then fails with
+`Destination already exists (different inode)` on every cycle, permanently. Same-inode
+collisions uniquify past (`track_2.flac`, `track_3.flac`, …) and are logged under
+`[STASH]`; the extra entries are directory entries against a live inode, so they cost
+no storage and unlink nothing.
+
+The suffix **counts**; it does not repeat. An earlier unary scheme (`track_.flac`,
+`track__.flac`, …) grew the filename one byte per collision, so a slot that had
+flapped a few hundred times hit NAME_MAX and became permanently un-vacatable. Slots
+are capped at `STASH_UNIQUIFY_MAX_ATTEMPTS` (1000) — hitting that cap means something
+upstream re-creates the source path every cycle, and the fix belongs in the
+classification that flaps, not in the stash.
+
 ### Pipeline Integration
 
 ```text
