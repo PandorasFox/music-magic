@@ -1390,7 +1390,19 @@ fn derive_sidecar_deploy_signals(
     // Collect unique corpus directories from precomputed files, with their
     // library_name and album_dir (deploy path parent).
     // dir_targets: corpus_dir → (library_name, album_dir)
+    //
+    // "Follow the audio": we only place sidecars alongside audio that is
+    // *actually* deployed to the library (`library_inode_to_paths`). The
+    // tag-derived `deploy_path` on a precomputed file is speculative — a
+    // corpus dir may lose release-packing to a duplicate source under a
+    // different library prefix, in which case its audio never lands there
+    // and any cover deployed via the speculative path becomes an orphan
+    // (audio in `soundtracks/`, cover alone in `music/`, cover then flagged
+    // Leftover on every cycle). Deferring to `library_inode_to_paths`
+    // matches the sidecar to the winner's actual library dir, or skips
+    // it entirely when no audio from this corpus dir deployed anywhere.
     let mut dir_targets: HashMap<String, (String, String)> = HashMap::new();
+    let mut corpus_dirs_seen: HashSet<String> = HashSet::new();
 
     for file in precomputed {
         let corpus_dir = Path::new(&file.corpus_path)
@@ -1398,19 +1410,45 @@ fn derive_sidecar_deploy_signals(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        corpus_dirs_seen.insert(corpus_dir.clone());
+
         if dir_targets.contains_key(&corpus_dir) {
             continue;
         }
 
-        // Resolve library name for this file's source directory
-        let library_name = config
-            .resolve_source_config_for_db_path(&file.corpus_path)
-            .and_then(|r| r.libraries.into_iter().next());
+        // File not deployed — try the next file for this corpus_dir.
+        let Some(lib_paths) = library_inode_to_paths.get(&file.inode) else {
+            continue;
+        };
+        let Some(lib_path) = lib_paths.first() else {
+            continue;
+        };
 
-        if let Some(lib) = library_name {
-            let album_dir = deploy_album_directory(&file.deploy_path);
-            dir_targets.insert(corpus_dir, (lib, album_dir));
+        // Library path format is "{library_name}/{album_dir}/{filename}".
+        // Split off the library name (first component) and the parent
+        // (everything above the filename) to get the album dir.
+        let mut comps = lib_path.components();
+        let Some(library_name) = comps
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let rest: PathBuf = comps.collect();
+        let Some(album_dir) = rest
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        if album_dir.is_empty() {
+            // A single-track library layout with no album dir isn't a place
+            // for sidecars — cover.jpg would land next to unrelated files.
+            continue;
         }
+
+        dir_targets.insert(corpus_dir, (library_name, album_dir));
     }
 
     // --- Batch query: 1 query instead of N per-directory LIKE scans ---
@@ -1561,9 +1599,10 @@ fn derive_sidecar_deploy_signals(
     );
 
     log_general(format!(
-        "[COMPUTE] DeriveCorpusDeployStatus sidecar reconcile: {} dirs, {} images, \
+        "[COMPUTE] DeriveCorpusDeployStatus sidecar reconcile: {} dirs ({} skipped: no deployed audio sibling), {} images, \
          SidecarDeployReady({}), SidecarDeployConflict({})",
         dir_targets.len(),
+        corpus_dirs_seen.len().saturating_sub(dir_targets.len()),
         all_images.len(),
         sc_stats,
         cc_stats,
