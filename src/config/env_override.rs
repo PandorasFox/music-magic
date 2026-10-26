@@ -190,6 +190,24 @@ fn apply_generic_field(config: &mut Config, block: &str, field: &str, val: &str)
                 return true;
             }
         }
+        (
+            Opinions::KDL_BLOCK_CANONICALIZATION,
+            CanonicalizationOpinions::KDL_ENABLE_STRING,
+        ) => {
+            if let Ok(b) = parse_bool(val) {
+                config.opinions.canonicalization.enable_string_canonicalizations = b;
+                return true;
+            }
+        }
+        (
+            Opinions::KDL_BLOCK_CANONICALIZATION,
+            CanonicalizationOpinions::KDL_ENABLE_GENRE,
+        ) => {
+            if let Ok(b) = parse_bool(val) {
+                config.opinions.canonicalization.enable_genre_canonicalizations = b;
+                return true;
+            }
+        }
 
         // health-detection (only scalar fields — required_tags is a list, skip it)
         (
@@ -254,6 +272,42 @@ fn apply_generic_field(config: &mut Config, block: &str, field: &str, val: &str)
         ) => {
             if let Ok(b) = parse_bool(val) {
                 config.opinions.duplicate_analysis.elide_variant_titles = b;
+                return true;
+            }
+        }
+        (
+            Opinions::KDL_BLOCK_DUPLICATE_ANALYSIS,
+            DuplicateAnalysisOpinions::KDL_ENABLE_FP_OVERLAP,
+        ) => {
+            if let Ok(b) = parse_bool(val) {
+                config
+                    .opinions
+                    .duplicate_analysis
+                    .enable_fingerprint_overlap_detection = b;
+                return true;
+            }
+        }
+        (
+            Opinions::KDL_BLOCK_DUPLICATE_ANALYSIS,
+            DuplicateAnalysisOpinions::KDL_ENABLE_METADATA_DUP,
+        ) => {
+            if let Ok(b) = parse_bool(val) {
+                config
+                    .opinions
+                    .duplicate_analysis
+                    .enable_metadata_duplicate_detection = b;
+                return true;
+            }
+        }
+        (
+            Opinions::KDL_BLOCK_DUPLICATE_ANALYSIS,
+            DuplicateAnalysisOpinions::KDL_ENABLE_RELEASE_OVERLAP,
+        ) => {
+            if let Ok(b) = parse_bool(val) {
+                config
+                    .opinions
+                    .duplicate_analysis
+                    .enable_release_overlap_detection = b;
                 return true;
             }
         }

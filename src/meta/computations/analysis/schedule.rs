@@ -39,30 +39,77 @@ pub fn execute_schedule_content_analysis(
         spawn.extend([
             Computation::DetectMusicBrainzTagged,
             Computation::DetectMissingTags,
-            Computation::DetectArtistTagCanonicalizations,
-            Computation::DetectAlbumArtistTagCanonicalizations,
-            Computation::DetectAlbumTagCanonicalizations,
-            Computation::DetectGenreTagCanonicalizations,
             Computation::DetectInconsistentAlbumArtist,
             Computation::DetectCompoundTagValues,
             Computation::DetectDiscExtractions,
             Computation::ImportGenresFromTags,
         ]);
+
+        // Album/artist/albumartist collision detection is expensive and
+        // gated by opinions.canonicalization.enable-string-canonicalizations
+        // (default: off).
+        let enable_string_canon = ctx
+            .snapshot
+            .config
+            .as_deref()
+            .is_some_and(|c| c.opinions.canonicalization.enable_string_canonicalizations);
+        if enable_string_canon {
+            spawn.extend([
+                Computation::DetectArtistTagCanonicalizations,
+                Computation::DetectAlbumArtistTagCanonicalizations,
+                Computation::DetectAlbumTagCanonicalizations,
+            ]);
+        }
+
+        // Genre collision detection is gated by
+        // opinions.canonicalization.enable-genre-canonicalizations (default:
+        // off) while the genre canonicalization design is being reworked.
+        let enable_genre_canon = ctx
+            .snapshot
+            .config
+            .as_deref()
+            .is_some_and(|c| c.opinions.canonicalization.enable_genre_canonicalizations);
+        if enable_genre_canon {
+            spawn.push(Computation::DetectGenreTagCanonicalizations);
+        }
     }
 
     // File/identity-sensitive computations
     if run_all || s.contains(RecomputationScope::FILES) {
         spawn.extend([
-            Computation::DetectFingerprintOverlaps,
             Computation::DetectDuplicateInodes,
             Computation::DetectLosslessRemux,
         ]);
+
+        // DetectFingerprintOverlaps (+ its downstream AnalyzeFingerprintOverlaps
+        // and DetectCrossSourceOverlaps) is expensive and gated behind
+        // opinions.duplicate-analysis.enable-fingerprint-overlap-detection
+        // (default: off).
+        let enable_fp = ctx
+            .snapshot
+            .config
+            .as_deref()
+            .is_some_and(|c| c.opinions.duplicate_analysis.enable_fingerprint_overlap_detection);
+        if enable_fp {
+            spawn.push(Computation::DetectFingerprintOverlaps);
+        }
     }
 
     // Cross-domain: tags OR files
     if run_all || s.touches_any(&[RecomputationScope::TAGS, RecomputationScope::FILES]) {
-        spawn.push(Computation::DetectMetadataDuplicates);
         spawn.push(Computation::DetectPathTagMismatches);
+
+        // DetectMetadataDuplicates is expensive and gated behind
+        // opinions.duplicate-analysis.enable-metadata-duplicate-detection
+        // (default: off).
+        let enable_metadata_dup = ctx
+            .snapshot
+            .config
+            .as_deref()
+            .is_some_and(|c| c.opinions.duplicate_analysis.enable_metadata_duplicate_detection);
+        if enable_metadata_dup {
+            spawn.push(Computation::DetectMetadataDuplicates);
+        }
     }
 
     // Deploy-sensitive: files OR deploy OR tags (deploy path depends on tags+files)
@@ -74,9 +121,24 @@ pub fn execute_schedule_content_analysis(
         ])
     {
         spawn.push(Computation::DetectDeployConflicts);
-        // DetectReleaseOverlaps spawns DeriveCorpusDeployStatus after
-        // wait_for_queue_drain(), ensuring overlap signals are visible.
-        spawn.push(Computation::DetectReleaseOverlaps);
+
+        // DetectReleaseOverlaps is expensive (iterates all corpus album dirs)
+        // and gated behind opinions.duplicate-analysis.enable-release-overlap-detection
+        // (default: off). When enabled, it spawns DeriveCorpusDeployStatus
+        // behind a barrier so fresh overlap signals are visible. When disabled,
+        // we spawn DeriveCorpusDeployStatus directly — it reads whatever
+        // ReleaseOverlap signals last landed (may be stale, that's the
+        // sunset trade-off).
+        let enable_release_overlap = ctx
+            .snapshot
+            .config
+            .as_deref()
+            .is_some_and(|c| c.opinions.duplicate_analysis.enable_release_overlap_detection);
+        if enable_release_overlap {
+            spawn.push(Computation::DetectReleaseOverlaps);
+        } else {
+            spawn.push(Computation::DeriveCorpusDeployStatus);
+        }
     }
 
     // Deploy health: tags OR deploy

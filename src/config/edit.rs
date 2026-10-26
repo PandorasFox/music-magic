@@ -84,6 +84,44 @@ pub fn apply_config_edits_to_kdl(
                 .strip_album_format_suffixes,
         );
     }
+    if new_config
+        .opinions
+        .canonicalization
+        .enable_string_canonicalizations
+        != old_config
+            .opinions
+            .canonicalization
+            .enable_string_canonicalizations
+    {
+        let block = ensure_child_block(opinions_doc, Opinions::KDL_BLOCK_CANONICALIZATION);
+        set_or_create_bool_node(
+            block,
+            CanonicalizationOpinions::KDL_ENABLE_STRING,
+            new_config
+                .opinions
+                .canonicalization
+                .enable_string_canonicalizations,
+        );
+    }
+    if new_config
+        .opinions
+        .canonicalization
+        .enable_genre_canonicalizations
+        != old_config
+            .opinions
+            .canonicalization
+            .enable_genre_canonicalizations
+    {
+        let block = ensure_child_block(opinions_doc, Opinions::KDL_BLOCK_CANONICALIZATION);
+        set_or_create_bool_node(
+            block,
+            CanonicalizationOpinions::KDL_ENABLE_GENRE,
+            new_config
+                .opinions
+                .canonicalization
+                .enable_genre_canonicalizations,
+        );
+    }
 
     // --- Health Detection ---
     let old_hd = &old_config.opinions.health_detection;
@@ -126,10 +164,7 @@ pub fn apply_config_edits_to_kdl(
     // --- Duplicate Analysis ---
     let old_da = &old_config.opinions.duplicate_analysis;
     let new_da = &new_config.opinions.duplicate_analysis;
-    if new_da.fingerprint_similarity_threshold != old_da.fingerprint_similarity_threshold
-        || new_da.duration_tolerance_ms != old_da.duration_tolerance_ms
-        || new_da.elide_variant_titles != old_da.elide_variant_titles
-    {
+    if new_da != old_da {
         let block = ensure_child_block(opinions_doc, Opinions::KDL_BLOCK_DUPLICATE_ANALYSIS);
         if new_da.fingerprint_similarity_threshold != old_da.fingerprint_similarity_threshold {
             set_or_create_float_node(
@@ -150,6 +185,31 @@ pub fn apply_config_edits_to_kdl(
                 block,
                 DuplicateAnalysisOpinions::KDL_ELIDE_VARIANTS,
                 new_da.elide_variant_titles,
+            );
+        }
+        if new_da.enable_fingerprint_overlap_detection
+            != old_da.enable_fingerprint_overlap_detection
+        {
+            set_or_create_bool_node(
+                block,
+                DuplicateAnalysisOpinions::KDL_ENABLE_FP_OVERLAP,
+                new_da.enable_fingerprint_overlap_detection,
+            );
+        }
+        if new_da.enable_metadata_duplicate_detection
+            != old_da.enable_metadata_duplicate_detection
+        {
+            set_or_create_bool_node(
+                block,
+                DuplicateAnalysisOpinions::KDL_ENABLE_METADATA_DUP,
+                new_da.enable_metadata_duplicate_detection,
+            );
+        }
+        if new_da.enable_release_overlap_detection != old_da.enable_release_overlap_detection {
+            set_or_create_bool_node(
+                block,
+                DuplicateAnalysisOpinions::KDL_ENABLE_RELEASE_OVERLAP,
+                new_da.enable_release_overlap_detection,
             );
         }
     }

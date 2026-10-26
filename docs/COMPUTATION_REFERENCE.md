@@ -73,15 +73,15 @@ This follows the same pattern as `pending_mutation_phases` (used for two-stage d
 | Computation | Description |
 |-------------|-------------|
 | ScheduleContentAnalysis | Orchestrator: spawns all detection computations |
-| DetectFingerprintOverlaps | Find tracks with identical fingerprints |
+| DetectFingerprintOverlaps | Find tracks with identical fingerprints. Gated behind `opinions.duplicate-analysis.enable-fingerprint-overlap-detection` (default off — being sunset). Downstream `AnalyzeFingerprintOverlaps` + `DetectCrossSourceOverlaps` are dependent phases and skip along with it. |
 | DetectDuplicateInodes | Find tracks sharing same inode |
 | DetectMusicBrainzTagged | Detect files with fully-applied MusicBrainz release tags (both configured track + release tags present). Emits MusicBrainzTagged per-file signals. Reconcile-based: clears when tags removed |
 | DetectMissingTags | Find tracks missing required tags. Routes ALBUM-only-missing (with ARTIST+TITLE) to MissingAlbumSingleSignal; checks ExpectedMissingTag for suppression. Skips MusicBrainz-tagged files |
-| DetectMetadataDuplicates | Find tracks with identical tag sets |
-| DetectArtistTagCanonicalizations | Find `artist` tag canonicalization opportunities. Reconciles only `TagCanonicitySignal` keys prefixed `artist:` |
-| DetectAlbumArtistTagCanonicalizations | Find `albumartist` tag canonicalization opportunities (across separator variants). Reconciles only keys prefixed `album_artist:` |
-| DetectAlbumTagCanonicalizations | Find `album` tag canonicalization opportunities (gated by disjoint release-id checks). Reconciles only keys prefixed `album:` |
-| DetectGenreTagCanonicalizations | Find `genre` tag canonicalization opportunities. Reconciles only keys prefixed `genre:` |
+| DetectMetadataDuplicates | Find tracks with identical tag sets. Gated behind `opinions.duplicate-analysis.enable-metadata-duplicate-detection` (default off — being sunset). |
+| DetectArtistTagCanonicalizations | Find `artist` tag canonicalization opportunities. Reconciles only `TagCanonicitySignal` keys prefixed `artist:`. Gated behind `opinions.canonicalization.enable-string-canonicalizations` (default off — being sunset). |
+| DetectAlbumArtistTagCanonicalizations | Find `albumartist` tag canonicalization opportunities (across separator variants). Reconciles only keys prefixed `album_artist:`. Gated behind `opinions.canonicalization.enable-string-canonicalizations` (default off — being sunset). |
+| DetectAlbumTagCanonicalizations | Find `album` tag canonicalization opportunities (gated by disjoint release-id checks). Reconciles only keys prefixed `album:`. Gated behind `opinions.canonicalization.enable-string-canonicalizations` (default off — being sunset). |
+| DetectGenreTagCanonicalizations | Find `genre` tag canonicalization opportunities. Reconciles only keys prefixed `genre:`. Gated behind `opinions.canonicalization.enable-genre-canonicalizations` (default off — design in flux). |
 | ImportGenresFromTags | Dirty-inode-aware: reads `dirty_inodes` keyed `import_genres_from_tags`, re-derives `source=FileTagImport` ledger rows for just those inodes, and clears their dirty markers. Per-inode it wipes existing FileTagImport rows for the inode before re-inserting so removed GENRE tag values don't linger. Empty dirty queue → no-op (formerly a full-corpus scan every TAGS-scope cycle). Bootstrap fallback: if the ledger has zero FileTagImport rows AND the dirty queue is empty, runs a one-shot full-corpus scan. Unresolved raws are coalesced into `unresolved_genre_observations`. Does NOT emit signals. Idempotent: upserts on `(inode, genre_id, source, kind)`. Runs in the TAGS-scope group of `ScheduleContentAnalysis`. Also queued by `EditGenreVocabularyMutation::additional_computations()` so newly-added aliases re-resolve previously-unresolved observations (note: this only re-runs dirty inodes — for a full re-resolve, requeue dirty-marking through a mutation). |
 | DeriveDiscogsGenreLedger | Watermark-gated: reads `discogs_genre_ledger_watermark` from `app_metadata` and only re-processes Discogs releases whose `discogs_release_cache.fetched_at > watermark`. Walks `mb_release_discogs_links` joined with the filtered cache rows, parses each cached Discogs release JSON, fans out to inodes packed to the linked MB release(s) via `signal_release_packing`, and writes ledger rows with `source=Discogs` (`Genres` → `kind=Genre`, `Styles` → `kind=Style`). After processing, advances the watermark to `MAX(fetched_at)` so subsequent EXTERNAL-scope cycles with no new fetches are no-ops. Unresolved raws push to `unresolved_genre_observations`. Does NOT emit signals. Idempotent via the `(inode, genre_id, source, kind)` PK. Scheduled at startup (`scope = None`) or when `EXTERNAL` scope is flagged (new Discogs JSON landed). Explicitly NOT in the TAGS bucket: release-packing/tag-edit cycles that don't add new Discogs data would have been pure waste. |
 | DetectInconsistentAlbumArtist | Find inconsistent album_artist across albums. Skips groups where any track has `COMPILATION=0` |
@@ -104,7 +104,7 @@ This follows the same pattern as `pending_mutation_phases` (used for two-stage d
 | DetectCrossSourceOverlaps | Cluster FingerprintOverlap signals by source directory (from config `dir` stanzas). Within-source overlaps ignored. |
 | IndexImageFile | Index corpus image file metadata (format, dimensions, role) into image_info table. Dirty-inode computation |
 | DetectDeployConflicts | Detect path collisions in deployment |
-| DetectReleaseOverlaps | Detect cross-source album-directory-level release overlaps |
+| DetectReleaseOverlaps | Detect cross-source album-directory-level release overlaps. Gated behind `opinions.duplicate-analysis.enable-release-overlap-detection` (default off — being sunset). When off, `ScheduleContentAnalysis` spawns `DeriveCorpusDeployStatus` directly instead of relying on this to defer it; deploy status runs against whatever `ReleaseOverlap` signals last landed. |
 | DeriveDeployHealthSignals | Derive library health signals (per library) |
 | DeriveCorpusDeployStatus | Derive corpus deploy status |
 

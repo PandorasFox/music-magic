@@ -111,12 +111,16 @@ startup {
 ```kdl
 canonicalization {
     strip-album-format-suffixes false
+    enable-string-canonicalizations false
+    enable-genre-canonicalizations false
 }
 ```
 
 | KDL Name | Type | Default | Description |
 |----------|------|---------|-------------|
 | `strip-album-format-suffixes` | bool | `false` | Strip EP/LP suffixes during album collision detection |
+| `enable-string-canonicalizations` | bool | `false` | Run album/artist/albumartist collision detection each TAGS cycle. These passes are expensive and largely superseded. |
+| `enable-genre-canonicalizations` | bool | `false` | Run genre collision detection each TAGS cycle. Off by default while the genre canonicalization design is being reworked; existing `genre:*` TagCanonicity signals are left untouched (not reconciled away) while disabled. |
 
 ### `health-detection` Block
 
@@ -170,6 +174,9 @@ duplicate-analysis {
     fingerprint-similarity-threshold 95.0
     duration-tolerance-ms 2000
     elide-variant-titles true
+    enable-fingerprint-overlap-detection false
+    enable-metadata-duplicate-detection false
+    enable-release-overlap-detection false
 }
 ```
 
@@ -178,6 +185,9 @@ duplicate-analysis {
 | `fingerprint-similarity-threshold` | f64 | `95.0` | Similarity threshold (0–100) below which pairs aren't duplicates |
 | `duration-tolerance-ms` | i64 | `2000` | Duration difference (ms) above which tracks are clustered separately |
 | `elide-variant-titles` | bool | `true` | Skip duplicate pairs where titles contain variant keywords (remix, live, etc.) |
+| `enable-fingerprint-overlap-detection` | bool | `false` | Run `DetectFingerprintOverlaps` (+ downstream `AnalyzeFingerprintOverlaps`, `DetectCrossSourceOverlaps`) each FILES cycle. Expensive; being sunset. |
+| `enable-metadata-duplicate-detection` | bool | `false` | Run `DetectMetadataDuplicates` each TAGS/FILES cycle. Expensive; being sunset. |
+| `enable-release-overlap-detection` | bool | `false` | Run `DetectReleaseOverlaps` each deploy-sensitive cycle. Expensive; being sunset. When off, `DeriveCorpusDeployStatus` still runs and reads whatever `ReleaseOverlap` signals last landed. |
 
 ### `release-packing` Block
 

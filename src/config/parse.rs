@@ -34,12 +34,29 @@ fn parse_quality_resolution_opinions(
 fn parse_canonicalization_opinions(node: &kdl::KdlNode, opinions: &mut CanonicalizationOpinions) {
     if let Some(children) = node.children() {
         for child in children.nodes() {
-            if child.name().value() == CanonicalizationOpinions::KDL_STRIP_SUFFIXES {
-                if let Some(entry) = child.entries().first() {
-                    if let Some(val) = entry.value().as_bool() {
-                        opinions.strip_album_format_suffixes = val;
+            match child.name().value() {
+                s if s == CanonicalizationOpinions::KDL_STRIP_SUFFIXES => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.strip_album_format_suffixes = val;
+                        }
                     }
                 }
+                s if s == CanonicalizationOpinions::KDL_ENABLE_STRING => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.enable_string_canonicalizations = val;
+                        }
+                    }
+                }
+                s if s == CanonicalizationOpinions::KDL_ENABLE_GENRE => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.enable_genre_canonicalizations = val;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -338,6 +355,27 @@ fn parse_duplicate_analysis_opinions(
                     if let Some(entry) = child.entries().first() {
                         if let Some(val) = entry.value().as_bool() {
                             opinions.elide_variant_titles = val;
+                        }
+                    }
+                }
+                DuplicateAnalysisOpinions::KDL_ENABLE_FP_OVERLAP => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.enable_fingerprint_overlap_detection = val;
+                        }
+                    }
+                }
+                DuplicateAnalysisOpinions::KDL_ENABLE_METADATA_DUP => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.enable_metadata_duplicate_detection = val;
+                        }
+                    }
+                }
+                DuplicateAnalysisOpinions::KDL_ENABLE_RELEASE_OVERLAP => {
+                    if let Some(entry) = child.entries().first() {
+                        if let Some(val) = entry.value().as_bool() {
+                            opinions.enable_release_overlap_detection = val;
                         }
                     }
                 }

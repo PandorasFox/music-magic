@@ -95,10 +95,19 @@ pub struct CanonicalizationOpinions {
     /// Strip EP/LP suffixes during album collision detection (default: false).
     /// When true, "Album EP" and "Album" normalize to the same key and collide.
     pub strip_album_format_suffixes: bool,
+    /// Run album/artist/albumartist collision detection each TAGS cycle
+    /// (default: false). Genre canonicalization has its own flag.
+    pub enable_string_canonicalizations: bool,
+    /// Run genre collision detection each TAGS cycle (default: false).
+    /// Disabled while the genre canonicalization design is in flux — see
+    /// `DetectGenreTagCanonicalizations` in docs/COMPUTATION_REFERENCE.md.
+    pub enable_genre_canonicalizations: bool,
 }
 
 impl CanonicalizationOpinions {
     pub const KDL_STRIP_SUFFIXES: &str = "strip-album-format-suffixes";
+    pub const KDL_ENABLE_STRING: &str = "enable-string-canonicalizations";
+    pub const KDL_ENABLE_GENRE: &str = "enable-genre-canonicalizations";
 }
 
 /// Which view to land on after startup progress completes.
@@ -236,6 +245,17 @@ pub struct DuplicateAnalysisOpinions {
     pub duration_tolerance_ms: i64,
     /// Skip duplicate pairs where either title contains variant keywords. Default: true
     pub elide_variant_titles: bool,
+    /// Run DetectFingerprintOverlaps (+ downstream AnalyzeFingerprintOverlaps,
+    /// DetectCrossSourceOverlaps) each FILES cycle (default: false). Expensive
+    /// full-corpus scan; being sunset.
+    pub enable_fingerprint_overlap_detection: bool,
+    /// Run DetectMetadataDuplicates each TAGS/FILES cycle (default: false).
+    /// Expensive; being sunset.
+    pub enable_metadata_duplicate_detection: bool,
+    /// Run DetectReleaseOverlaps each deploy-sensitive cycle (default: false).
+    /// Expensive; being sunset. DeriveCorpusDeployStatus still runs and reads
+    /// whatever ReleaseOverlap signals last landed.
+    pub enable_release_overlap_detection: bool,
 }
 
 impl Default for DuplicateAnalysisOpinions {
@@ -244,6 +264,9 @@ impl Default for DuplicateAnalysisOpinions {
             fingerprint_similarity_threshold: 95.0,
             duration_tolerance_ms: 2000,
             elide_variant_titles: true,
+            enable_fingerprint_overlap_detection: false,
+            enable_metadata_duplicate_detection: false,
+            enable_release_overlap_detection: false,
         }
     }
 }
@@ -252,6 +275,9 @@ impl DuplicateAnalysisOpinions {
     pub const KDL_FP_THRESHOLD: &str = "fingerprint-similarity-threshold";
     pub const KDL_DURATION_TOLERANCE: &str = "duration-tolerance-ms";
     pub const KDL_ELIDE_VARIANTS: &str = "elide-variant-titles";
+    pub const KDL_ENABLE_FP_OVERLAP: &str = "enable-fingerprint-overlap-detection";
+    pub const KDL_ENABLE_METADATA_DUP: &str = "enable-metadata-duplicate-detection";
+    pub const KDL_ENABLE_RELEASE_OVERLAP: &str = "enable-release-overlap-detection";
 }
 
 /// Scoring dimension weights for release bin-packing assignment.
