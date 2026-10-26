@@ -223,7 +223,7 @@ pub fn extract_picture_info(path: &Path) -> Option<PictureInfo> {
 /// Build a TagSet from VorbisComments (shared by FLAC, Opus, OGG Vorbis).
 ///
 /// Reads raw key=value pairs directly — no ItemKey mapping, no bijection problem.
-fn tagset_from_vorbis_comments(vc: Option<&lofty::ogg::VorbisComments>) -> TagSet {
+fn tagset_from_vorbis_comments(vc: Option<&lofty::ogg::tag::VorbisComments>) -> TagSet {
     let Some(vc) = vc else {
         return TagSet::empty();
     };
@@ -485,7 +485,7 @@ fn is_binary_tag_key(key: &str) -> bool {
 
 /// Write tags to a FLAC file via VorbisComments.
 fn write_vorbis_tags_flac(path: &Path, tags: &TagSet) -> Result<()> {
-    use lofty::ogg::VorbisComments;
+    use lofty::ogg::tag::VorbisComments;
 
     let mut reader = open_buffered(path)?;
     let mut flac = lofty::flac::FlacFile::read_from(&mut reader, parse_options())
@@ -536,7 +536,7 @@ write_vorbis_ogg_format!(write_vorbis_tags_ogg, lofty::ogg::VorbisFile, "OGG");
 /// Clears existing tags, then pushes each (key, value) pair.
 /// Multi-value fields (e.g., multiple genres) are naturally supported
 /// since push() allows duplicate keys.
-fn populate_vorbis_comments(vc: &mut lofty::ogg::VorbisComments, tags: &TagSet) {
+fn populate_vorbis_comments(vc: &mut lofty::ogg::tag::VorbisComments, tags: &TagSet) {
     use lofty::tag::TagExt as _;
     vc.clear();
     for (key, value) in tags.iter() {
@@ -1442,6 +1442,52 @@ mod tests {
         assert!(size > 100, "FLAC file suspiciously small: {} bytes", size);
     }
 
+    /// Byte offset of the first audio frame: end of the FLAC metadata block chain.
+    fn flac_audio_start(bytes: &[u8]) -> usize {
+        assert_eq!(&bytes[..4], b"fLaC");
+        let mut pos = 4;
+        loop {
+            let header = &bytes[pos..pos + 4];
+            let is_last = header[0] & 0x80 != 0;
+            let len = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+            pos += 4 + len;
+            if is_last {
+                return pos;
+            }
+        }
+    }
+
+    #[test]
+    fn test_flac_shrinking_tags_do_not_leave_trailing_junk() {
+        // Regression for lofty 0.23.x (yanked): the FLAC writer rewrote the file in
+        // place without truncating, so any tag edit that shrank the metadata left
+        // the old tail bytes after the real end of stream.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.flac");
+        generate_flac_fixture(&path);
+
+        let original = std::fs::read(&path).unwrap();
+        let audio = original[flac_audio_start(&original)..].to_vec();
+        assert!(!audio.is_empty());
+
+        // Grow the metadata well beyond the audio length, then shrink it back.
+        let big = TagSet::new(vec![("comment".to_string(), "x".repeat(audio.len() * 4))]);
+        write_tags_to_file(&path, &big).unwrap();
+        let grown = std::fs::read(&path).unwrap();
+        assert!(grown.len() > original.len());
+
+        let small = TagSet::new(vec![("title".to_string(), "small".to_string())]);
+        write_tags_to_file(&path, &small).unwrap();
+
+        let shrunk = std::fs::read(&path).unwrap();
+        assert!(shrunk.len() < grown.len(), "file did not shrink after removing tags");
+        assert_eq!(
+            &shrunk[flac_audio_start(&shrunk)..],
+            &audio[..],
+            "audio region changed or trailing junk left after metadata shrink"
+        );
+    }
+
     // =========================================================================
     // Opus round-trip tests
     // =========================================================================
@@ -1730,7 +1776,7 @@ mod tests {
     #[test]
     fn test_from_vorbis_comments_filters_binary_keys() {
         // Construct VorbisComments with a binary-pattern key
-        let mut vc = lofty::ogg::VorbisComments::default();
+        let mut vc = lofty::ogg::tag::VorbisComments::default();
         vc.push("ARTIST".to_string(), "Foo".to_string());
         vc.push(
             "METADATA_BLOCK_PICTURE".to_string(),
