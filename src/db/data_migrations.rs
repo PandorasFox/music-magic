@@ -370,6 +370,26 @@ pub fn all_data_migrations() -> Vec<DataMigrationEntry> {
             },
         },
         DataMigrationEntry {
+            id: "2026-08-purge-dead-dirty-inodes",
+            description: "Delete dirty_inodes rows whose computation_type has no live consumer. \
+                          `seed_dirty_inodes_all` previously seeded 14 types; only 5 are actually \
+                          drained by an analysis stage. In prod this had accumulated ~460k \
+                          immortal rows from a March schema reconcile.",
+            apply: |db| {
+                let dropped = db.conn().execute(
+                    "DELETE FROM dirty_inodes WHERE computation_type NOT IN \
+                     ('compound_tag', 'lossless_remux', 'sidecar_deploy', 'release_packing', \
+                      'corpus_deploy_status', 'import_genres_from_tags', 'pending_write')",
+                    [],
+                )?;
+                crate::logging::log_general(format!(
+                    "[MIGRATION] Purged {} dead dirty_inodes rows (types with no live consumer)",
+                    dropped
+                ));
+                Ok(())
+            },
+        },
+        DataMigrationEntry {
             id: "2026-05-backfill-file-in-corpus-from-index",
             description: "Backfill signal_file_in_corpus for every indexed corpus audio inode \
                           (FileInCorpus is now indexer-owned; this catches inodes that were \

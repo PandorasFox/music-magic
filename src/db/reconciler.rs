@@ -294,7 +294,7 @@ impl ReconciliationPlan {
             .with_context(|| format!("Failed to add column '{}.{}'", c.table, c.column))?;
         }
 
-        // 3. Drop+recreate computed signal tables, seed dirty inodes
+        // 3. Drop+recreate computed signal tables, then seed dirty inodes once
         for s in &self.recreated_signals {
             crate::logging::log_general(format!(
                 "[RECONCILER] Recreating signal table: {}",
@@ -303,8 +303,8 @@ impl ReconciliationPlan {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {}", s.table))?;
             conn.execute_batch(&s.create_sql)
                 .with_context(|| format!("Failed to recreate table '{}'", s.table))?;
-
-            // Seed all corpus inodes as dirty so signals get recomputed
+        }
+        if !self.recreated_signals.is_empty() {
             seed_dirty_inodes_all(conn)?;
         }
 
@@ -444,29 +444,26 @@ fn check_missing_indices(
     Ok(())
 }
 
-/// Re-seed all corpus inodes as dirty for all computation types.
+/// Re-seed all corpus inodes as dirty for the dirty-queue-driven computations.
 ///
-/// Used after recreating signal tables to trigger full recomputation.
+/// Only computation types whose analysis stage actually drains `dirty_inodes`
+/// belong here — derivation-phase signals (healthy_file, corrupt_file, etc.)
+/// are rebuilt by full-scan derivation, not by consuming dirty markers.
+/// Seeding types with no consumer produced ~half a million immortal rows in
+/// prod. See [[project_dirty_inode_dead_types]] in memory for the audit.
 fn seed_dirty_inodes_all(conn: &Connection) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Get all computation types that have dirty_inodes entries or are known
-    // We seed for a broad set of computation types so everything recomputes
+    // Types with a live `get_dirty_inodes(…)` consumer that requires a seed
+    // for full-corpus recomputation. `import_genres_from_tags` is intentionally
+    // excluded — its consumer is designed to populate dynamically from TAGS
+    // mutations and treats an empty queue as a no-op.
     let computation_types = [
-        "file_in_corpus",
-        "unindexed_file",
-        "healthy_file",
-        "corrupt_file",
-        "lossless_remux",
         "compound_tag",
-        "missing_tag",
-        "path_tag_mismatch",
-        "deploy_ready",
-        "oob_tag_sync",
-        "external_match",
+        "lossless_remux",
         "sidecar_deploy",
         "release_packing",
         "corpus_deploy_status",
