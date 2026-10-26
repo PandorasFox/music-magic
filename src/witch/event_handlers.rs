@@ -348,6 +348,12 @@ impl super::Witch {
                 if stats.matched > 0 {
                     self.session_recomputation_scope |=
                         crate::meta::recomputation::RecomputationScope::EXTERNAL;
+                    // Waiting for AllDone to trigger packing means a stuck or
+                    // long-running stage (MB fetches, AcoustID rate-limiting)
+                    // leaves release_packing dirty flags to accumulate for
+                    // days. Firing per-source keeps the incremental backlog
+                    // draining as soon as each source contributes matches.
+                    self.pending_work.insert(super::types::PendingWork::PACKING);
                 }
             }
             external_fetch::SchedulerMessage::AllDone => {

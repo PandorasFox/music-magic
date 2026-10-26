@@ -193,8 +193,16 @@ impl super::Witch {
                 }
             }
             WorkState::Done { finished_at, .. } => {
-                // Done → Idle: after linger timeout
-                if finished_at.elapsed() >= Self::LINGER_DURATION {
+                // Short-circuit the linger when the watcher has accumulated
+                // observations that need derivation. The linger exists to keep
+                // completion status visible while nothing else is happening;
+                // new corpus observations trump that — the incoming work
+                // session publishes its own status. Without this, watcher
+                // events sit in `observed_inodes` unindexed for up to
+                // LINGER_DURATION.
+                let needs_derivation = self.watcher_derivation_needed
+                    && self.reasoning_level == ReasoningLevel::Full;
+                if needs_derivation || finished_at.elapsed() >= Self::LINGER_DURATION {
                     self.transition_to_idle();
                 }
                 // Done → Working: handled in queue methods
