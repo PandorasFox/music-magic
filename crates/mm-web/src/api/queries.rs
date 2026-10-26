@@ -265,9 +265,19 @@ body_web_query!(
 
 // -- Param-parsed queries (custom extraction per struct) --
 
-impl WebQuery for GetOobFiles {
+impl WebQuery for GetOobSummary {
     fn from_web(params: &HashMap<String, String>, _: &[u8]) -> Result<Self, ApiError> {
-        Ok(Self { bucket: parse_optional_enum(params, "bucket")? })
+        // `limit` is clamped rather than trusted: the OOB tables run to
+        // hundreds of thousands of rows, and an unbounded page would rebuild
+        // the full-table load this query exists to replace.
+        let limit = parse_optional_usize(params, "limit")?
+            .unwrap_or(Self::PAGE)
+            .clamp(1, Self::PAGE);
+        Ok(Self {
+            bucket: parse_optional_enum(params, "bucket")?,
+            offset: parse_optional_usize(params, "offset")?.unwrap_or(0),
+            limit,
+        })
     }
 }
 
@@ -278,6 +288,12 @@ impl WebQuery for GetDiscExtractionData {
 }
 
 impl WebQuery for GetDeployData {
+    fn from_web(_: &HashMap<String, String>, _body: &[u8]) -> Result<Self, ApiError> {
+        Ok(Self)
+    }
+}
+
+impl WebQuery for GetDeployReadyFiles {
     fn from_web(_: &HashMap<String, String>, _body: &[u8]) -> Result<Self, ApiError> {
         Ok(Self)
     }
@@ -408,14 +424,14 @@ fn build_domain_payload(
     dispatch_route!(route, params, body;
         GetInsights, GetDeployStatus,
         GetExternalMatches, GetPackingDirs,
-        GetOobFiles,
+        GetOobSummary,
         GetMovedFiles, GetMissingAlbumSingleSignals,
         GetPackingKnots, GetPackingInodePaths,
         GetDiscExtractionData,
         GetMissingFileData, GetMissingDirectoryData, GetCorruptFileData,
         GetArtistNeedsPluralData,
         GetSubparDuplicateData, GetDirectoryClusterData, GetReleaseOverlapData,
-        GetLosslessRemuxData, GetDeployData,
+        GetLosslessRemuxData, GetDeployData, GetDeployReadyFiles,
         GetManualReviewData, GetCorpusTags, GetPackingBrowserData,
         GetUnsolvedPackingData,
         GetAudioFilesByInodes, GetInodeDetails,
@@ -456,6 +472,20 @@ fn require_param(params: &HashMap<String, String>, key: &str) -> Result<String, 
 
 fn parse_bool(params: &HashMap<String, String>, key: &str) -> bool {
     params.get(key).map(|v| v == "true").unwrap_or(false)
+}
+
+/// Parse an optional non-negative integer from a query string parameter.
+fn parse_optional_usize(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Result<Option<usize>, ApiError> {
+    match params.get(key) {
+        Some(s) => s
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|e| ApiError::BadRequest(format!("invalid '{key}': {e}"))),
+        None => Ok(None),
+    }
 }
 
 /// Parse a serde enum variant name from a query string parameter.

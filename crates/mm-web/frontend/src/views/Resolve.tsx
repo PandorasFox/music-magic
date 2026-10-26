@@ -8,7 +8,7 @@ import {
   useSubparDuplicateData,
   useLosslessRemuxData,
   useMovedFiles,
-  useOobFiles,
+  useOobSummary,
 } from "../api/queries";
 import { post, ApiError } from "../api/client";
 import type {
@@ -20,6 +20,7 @@ import type {
   LosslessRemuxModalData,
   MovedFileInfo,
   OobFile,
+  ConflictBucket,
 } from "../api/generated/types";
 
 // -- Shared staging helper --
@@ -274,20 +275,27 @@ function MovedFiles() {
 
   if (isLoading) return <div className="view-loading">Loading...</div>;
   if (error) return <div className="view-error">{error.message}</div>;
-  if (!data || data.length === 0) return <div className="view-placeholder">No moved files</div>;
+  if (!data || data.total === 0) return <div className="view-placeholder">No moved files</div>;
 
   function acceptAll() {
-    const mutations = (data as MovedFileInfo[]).map((f) => ({
-      UpdateFilePath: { inode: f.inode, old_path: f.old_path, new_path: f.new_path, new_zone: f.new_zone },
-    }));
+    // One bulk mutation regardless of scale — the worker applies the whole
+    // outstanding set. Sending one per file meant ~660k mutations.
+    const mutations = [{ AcknowledgeMovedFiles: { observed_count: data!.total } }];
     void stageBatch("MovedFile", "Accept moved files", mutations, navigate, setErr, setStaging);
   }
 
+  const truncated = data.total > data.sample.length;
+
   return (
     <div className="resolve-view">
-      <h2>Moved Files ({data.length})</h2>
+      <h2>Moved Files ({data.total})</h2>
       {err && <div className="form-error">{err}</div>}
-      {data.map((f: MovedFileInfo) => (
+      {truncated && (
+        <div className="resolve-muted">
+          Showing first {data.sample.length}; accepting applies to all {data.total}.
+        </div>
+      )}
+      {data.sample.map((f: MovedFileInfo) => (
         <div key={f.inode} className="resolve-row">
           <span className="resolve-muted">{f.old_path}</span>
           <span className="deploy-stale-arrow">&rarr;</span>
@@ -370,17 +378,49 @@ function ArtistNeedsPlural() {
 
 // -- OOB Tag Resolution --
 
-function OobResolution({ bucket }: { bucket: string }) {
-  const { data, isLoading, error } = useOobFiles(bucket);
+function OobResolution({ bucket }: { bucket: ConflictBucket }) {
+  const { data, isLoading, error } = useOobSummary(bucket);
+  const navigate = useNavigate();
+  const [staging, setStaging] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
   if (isLoading) return <div className="view-loading">Loading...</div>;
   if (error) return <div className="view-error">{error.message}</div>;
-  if (!data || data.length === 0) return <div className="view-placeholder">No OOB files in this bucket</div>;
+
+  // Indexed access is `number | undefined` under noUncheckedIndexedAccess,
+  // though BUCKET_INDEX only ever yields 0..3 into a fixed 4-tuple.
+  const total = data?.counts[BUCKET_INDEX[bucket]] ?? 0;
+  if (!data || total === 0)
+    return <div className="view-placeholder">No OOB files in this bucket</div>;
+
+  // One bulk mutation regardless of scale — the worker walks the bucket
+  // itself. Sending one per file meant ~500k mutations during a tag rewrite.
+  function resolveAll(action: string, label: string) {
+    const mutations = [
+      { ResolveOobBucket: { bucket, action, observed_count: total } },
+    ];
+    void stageBatch(
+      { OobResolution: { bucket } },
+      label,
+      mutations,
+      navigate,
+      setErr,
+      setStaging,
+    );
+  }
+
+  const truncated = data.offset + data.files.length < total;
 
   return (
     <div className="resolve-view">
-      <h2>OOB Files: {bucket} ({data.length})</h2>
-      {data.map((f: OobFile) => (
+      <h2>OOB Files: {bucket} ({total})</h2>
+      {err && <div className="form-error">{err}</div>}
+      {truncated && (
+        <div className="resolve-muted">
+          Showing first {data.files.length}; actions apply to all {total}.
+        </div>
+      )}
+      {data.files.map((f: OobFile) => (
         <div key={f.inode} className="resolve-row resolve-row--col">
           <span>{f.path}</span>
           {f.mismatches.length > 0 && (
@@ -396,9 +436,42 @@ function OobResolution({ bucket }: { bucket: string }) {
           )}
         </div>
       ))}
+      <div className="resolve-actions">
+        {bucket === "MtimeOnly" ? (
+          <button
+            onClick={() => resolveAll("AcknowledgeMtime", "Acknowledge mtime changes")}
+            disabled={staging}
+          >
+            {staging ? "Staging..." : `Acknowledge All (${total})`}
+          </button>
+        ) : (
+          <>
+            <button
+              onClick={() => resolveAll("AssimilateDiskToDb", "Assimilate file tags \u2192 DB")}
+              disabled={staging}
+            >
+              {staging ? "Staging..." : `Assimilate Files \u2192 DB (${total})`}
+            </button>
+            <button
+              onClick={() => resolveAll("ApplyDbToDisk", "Apply DB tags \u2192 files")}
+              disabled={staging}
+            >
+              {staging ? "Staging..." : `Apply DB \u2192 Files (${total})`}
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }
+
+// Position of each bucket within `OobSummary.counts`.
+const BUCKET_INDEX: Record<ConflictBucket, number> = {
+  MtimeOnly: 0,
+  DbOnly: 1,
+  DiskOnly: 2,
+  Conflict: 3,
+};
 
 // -- Route dispatcher --
 

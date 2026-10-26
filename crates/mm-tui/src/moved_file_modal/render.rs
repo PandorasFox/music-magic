@@ -28,12 +28,20 @@ impl ModalFrame for MovedFileState {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let count = self.data.files.len();
-        let text = format!(
-            "Moved Files: {} file{} detected with path changes",
-            count,
-            if count == 1 { "" } else { "s" }
-        );
+        let summary = &self.data.summary;
+        let text = if summary.is_truncated() {
+            format!(
+                "Moved Files: {} files detected with path changes (listing first {})",
+                summary.total,
+                summary.sample.len(),
+            )
+        } else {
+            format!(
+                "Moved Files: {} file{} detected with path changes",
+                summary.total,
+                if summary.total == 1 { "" } else { "s" }
+            )
+        };
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -51,7 +59,7 @@ impl ModalFrame for MovedFileState {
         is_cursor: bool,
         _is_focused: bool,
     ) -> ListItem<'static> {
-        let file = &self.data.files[idx];
+        let file = &self.data.summary.sample[idx];
         let indicator = if is_cursor { "\u{25b6} " } else { "  " };
         let style = if is_cursor {
             CURSOR_STYLE
@@ -73,11 +81,9 @@ impl ModalFrame for MovedFileState {
 
         let inner = render_pane(f, area, block);
 
-        if self.data.files.is_empty() {
+        let Some(file) = self.data.summary.sample.get(self.list.cursor) else {
             return;
-        }
-
-        let file = &self.data.files[self.list.cursor];
+        };
 
         let mut lines = Vec::new();
         lines.extend(

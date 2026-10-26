@@ -216,12 +216,25 @@ pub struct DeployMutationSet {
 ///
 /// Loaded once when the modal opens, contains all signal lists.
 /// This prevents database queries during render.
+///
+/// The Healthy category is intentionally represented as aggregate counts
+/// rather than a per-file list: for a real library it can be tens of
+/// thousands of rows, and nothing on that tab is actionable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeployModalData {
-    /// Healthy files: deployed at correct library path
-    pub healthy: Vec<DeploySignalFile>,
-    /// New files: ready to deploy (not yet in library)
-    pub new: Vec<DeploySignalFile>,
+    /// Total healthy (correctly-deployed) files across all libraries.
+    pub healthy_count: usize,
+    /// Healthy files grouped by library (library_name, count), sorted by name.
+    pub healthy_by_library: Vec<(String, usize)>,
+    /// Total new files ready to deploy (not yet in library).
+    ///
+    /// The per-file list is deliberately not carried in this payload: on a
+    /// real corpus it runs to ~500k rows, and nothing in the New tab is
+    /// per-file actionable (selection and rendering are directory-level).
+    /// Staging re-fetches the list via `GetDeployReadyFiles` at confirm time.
+    pub new_count: usize,
+    /// New files grouped by library (library_name, count), sorted by name.
+    pub new_by_library: Vec<(String, usize)>,
     /// New files aggregated by directory (sorted by count desc)
     pub new_by_dir: Vec<DirectoryAggregate>,
     /// Conflict groups: multiple corpus files -> same library path
@@ -246,8 +259,8 @@ impl DeployModalData {
     /// Get counts for each tab (for display in tab bar).
     pub fn tab_counts(&self) -> [usize; 5] {
         [
-            self.healthy.len(),
-            self.new.len() + self.sidecars.len(),
+            self.healthy_count,
+            self.new_count + self.sidecars.len(),
             self.conflicts.len() + self.sidecar_conflicts.len(),
             self.leftover.len(),
             self.stale.len(),
@@ -255,16 +268,24 @@ impl DeployModalData {
     }
 
     /// Total operations that will be performed (excluding healthy).
-    /// Conflict winners now appear in `new` via the computation layer.
+    /// Conflict winners are counted in `new_count` via the computation layer.
     pub fn total_operations(&self) -> usize {
-        self.new.len() + self.stale.len() + self.leftover.len() + self.sidecars.len()
+        self.new_count + self.stale.len() + self.leftover.len() + self.sidecars.len()
     }
 
     /// Convert all deploy modal data into staged mutations.
     ///
     /// Ordering within `deploy`: leftovers first -> stale -> new
     /// (stash orphans before moving/linking into those paths).
-    pub fn to_mutations(&self, resolver: &PathResolver) -> DeployMutationSet {
+    ///
+    /// `new_files` is passed in rather than read off `self` because the modal
+    /// payload carries only counts — callers fetch the per-file list with
+    /// `GetDeployReadyFiles` at confirm time.
+    pub fn to_mutations(
+        &self,
+        new_files: &[DeploySignalFile],
+        resolver: &PathResolver,
+    ) -> DeployMutationSet {
         let mut deploy = Vec::new();
         let mut skipped = 0usize;
 
@@ -279,7 +300,7 @@ impl DeployModalData {
         }
 
         // 3. New: deploy hard links (destinations now clear)
-        for file in &self.new {
+        for file in new_files {
             match file.to_mutation(resolver) {
                 Some(m) => deploy.push(m),
                 None => skipped += 1,

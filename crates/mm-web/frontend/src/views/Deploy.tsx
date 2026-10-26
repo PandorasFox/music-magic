@@ -4,7 +4,6 @@ import { useDeployStatus, useDeployData } from "../api/queries";
 import { post } from "../api/client";
 import type {
   DeployModalData,
-  DeploySignalFile,
   StaleSignalFile,
   ConflictGroup,
   DirectoryAggregate,
@@ -36,19 +35,36 @@ function TabButton({
   );
 }
 
-function HealthyTab({ files }: { files: DeploySignalFile[] }) {
-  const show = files.slice(0, 200);
+function HealthyTab({
+  total,
+  byLibrary,
+}: {
+  total: number;
+  byLibrary: [string, number][];
+}) {
+  if (total === 0) {
+    return (
+      <div className="deploy-panel deploy-empty">
+        No healthy deployments yet.
+      </div>
+    );
+  }
   return (
     <div className="deploy-panel">
-      {show.map((f, i) => (
-        <div key={i} className="deploy-file-row">
-          <span className="deploy-file-lib">{f.library_name}</span>
-          <span className="deploy-file-path">{f.deploy_path}</span>
+      <div className="deploy-file-row">
+        <span className="deploy-file-lib">Total</span>
+        <span className="deploy-file-path">
+          {total.toLocaleString()} deployed
+        </span>
+      </div>
+      {byLibrary.map(([name, count]) => (
+        <div key={name} className="deploy-file-row">
+          <span className="deploy-file-lib">{name}</span>
+          <span className="deploy-file-path">
+            {count.toLocaleString()} deployed
+          </span>
         </div>
       ))}
-      {files.length > 200 && (
-        <div className="deploy-more">...and {files.length - 200} more</div>
-      )}
     </div>
   );
 }
@@ -141,12 +157,12 @@ function LibrarySummaries({ summaries }: { summaries: LibrarySummary[] }) {
 function DeployPreview({ data }: { data: DeployModalData }) {
   const navigate = useNavigate();
   const totalOps =
-    data.new.length +
+    data.new_count +
     data.leftover.length +
     data.stale.length +
     data.sidecars.length;
 
-  const initialTab: Tab = data.new.length > 0 ? "new" : "healthy";
+  const initialTab: Tab = data.new_count > 0 ? "new" : "healthy";
   const [activeTab, setActiveTab] = useState<Tab>(initialTab);
   const [staging, setStaging] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -179,14 +195,16 @@ function DeployPreview({ data }: { data: DeployModalData }) {
       {message && <div className="cfg-message cfg-message--error">{message}</div>}
 
       <div className="deploy-tabs">
-        <TabButton tab="healthy" label="Healthy" count={data.healthy.length} active={activeTab === "healthy"} onClick={setActiveTab} />
-        <TabButton tab="new" label="New" count={data.new.length} active={activeTab === "new"} onClick={setActiveTab} />
+        <TabButton tab="healthy" label="Healthy" count={data.healthy_count} active={activeTab === "healthy"} onClick={setActiveTab} />
+        <TabButton tab="new" label="New" count={data.new_count} active={activeTab === "new"} onClick={setActiveTab} />
         <TabButton tab="conflicts" label="Conflicts" count={data.conflicts.length} active={activeTab === "conflicts"} onClick={setActiveTab} />
         <TabButton tab="leftover" label="Leftover" count={data.leftover.length} active={activeTab === "leftover"} onClick={setActiveTab} />
         <TabButton tab="stale" label="Stale" count={data.stale.length} active={activeTab === "stale"} onClick={setActiveTab} />
       </div>
 
-      {activeTab === "healthy" && <HealthyTab files={data.healthy} />}
+      {activeTab === "healthy" && (
+        <HealthyTab total={data.healthy_count} byLibrary={data.healthy_by_library} />
+      )}
       {activeTab === "new" && <NewTab dirs={data.new_by_dir} />}
       {activeTab === "conflicts" && <ConflictsTab conflicts={data.conflicts} />}
       {activeTab === "leftover" && <LeftoverTab dirs={data.leftover_by_dir} />}

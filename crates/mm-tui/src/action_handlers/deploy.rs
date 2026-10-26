@@ -22,7 +22,10 @@ impl HandleAction for deploy_modal::DeployAction {
                     _ => None,
                 };
                 if let Some(data) = cached_data {
-                    let mutation_count = app.stage_deploy_mutations(&data, w);
+                    // The modal payload carries counts only; fetch the
+                    // per-file list now that the operator has committed.
+                    let new_files = app.query(mm_meta::domain_queries::GetDeployReadyFiles);
+                    let mutation_count = app.stage_deploy_mutations(&data, &new_files, w);
                     if mutation_count > 0 {
                         app.after_staging_decisions();
                     } else {
@@ -41,9 +44,10 @@ impl App {
     fn stage_deploy_mutations(
         &mut self,
         data: &deploy_modal::DeployModalData,
+        new_files: &[mm_meta::views::DeploySignalFile],
         gesture: &witness::ConfirmationGesture,
     ) -> usize {
-        let prepared = mm_ui::deploy::prepare_deploy_decisions(data, &self.resolver);
+        let prepared = mm_ui::deploy::prepare_deploy_decisions(data, new_files, &self.resolver);
 
         if prepared.skipped > 0 {
             mm_meta::logging::log_error(format!(

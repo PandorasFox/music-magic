@@ -31,27 +31,157 @@ impl Database {
         Ok(results)
     }
 
-    /// Get all deployed healthy files (corpus files correctly deployed to library).
+    /// Count of healthy deployments grouped by library.
     ///
-    /// Returns files with their corpus path and library path.
-    /// Sorted by corpus_path for consistent display.
-    pub fn get_deployed_healthy_files(&self) -> Result<Vec<crate::meta::views::DeploySignalFile>> {
-        use crate::meta::views::DeploySignalFile;
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, library_path FROM signal_deployed_healthy ORDER BY path")?;
+    /// `library_path` is stored as `"{library_name}/relative/path"`; the
+    /// library name is derived by splitting on the first `/`. Returns
+    /// `(library_name, count)` sorted by name.
+    ///
+    /// This replaces the older per-file loader for consumers that only need
+    /// counts — the full list can run to tens of thousands of rows on a real
+    /// library and nothing on the Healthy tab is actionable.
+    pub fn get_deployed_healthy_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT SUBSTR(library_path, 1, INSTR(library_path, '/') - 1) AS lib, COUNT(*) \
+             FROM signal_deployed_healthy \
+             GROUP BY lib \
+             ORDER BY lib",
+        )?;
 
         let results = stmt
             .query_map(params![], |row| {
-                let library_path: String = row.get(1)?;
-                // library_path is "{library_name}/relative/path" — extract library_name
+                let lib: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((lib, count as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Healthy deployments whose `library_path` collides with a pending
+    /// deploy-ready destination.
+    ///
+    /// Used for superseded-deployment detection: a healthy file whose library
+    /// path matches a pending new deployment's destination has lost its
+    /// conflict-tiebreak and needs to be moved to `leftover` so the winner
+    /// can take that path. Returns entries shaped for direct extension into
+    /// the leftover vec.
+    ///
+    /// This is a single join rather than chunked `IN (...)` batches over the
+    /// deploy-ready destination list: with ~500k pending deployments that
+    /// loop issued ~570 unindexed scans of `signal_deployed_healthy` and
+    /// dominated deploy-view load time (~30s). The join does it in one pass.
+    pub fn get_superseded_healthy(&self) -> Result<Vec<crate::meta::views::LeftoverSignalFile>> {
+        use crate::meta::views::LeftoverSignalFile;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT h.library_path \
+             FROM signal_deployed_healthy h \
+             JOIN signal_deploy_ready r \
+               ON h.library_path = r.library_name || '/' || r.deploy_path \
+             WHERE r.library_name != ''",
+        )?;
+
+        let results = stmt
+            .query_map(params![], |row| {
+                let library_path: String = row.get(0)?;
                 let library_name = library_path.split('/').next().unwrap_or("").to_string();
-                Ok(DeploySignalFile {
+                Ok(LeftoverSignalFile {
                     library_name,
-                    corpus_path: row.get(0)?,
-                    deploy_path: library_path,
+                    library_path,
                 })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Which of the given library paths are destinations of a pending
+    /// deploy-ready file.
+    ///
+    /// Callers pass the (small) leftover path list to find how many leftovers
+    /// are about to be replaced by an incoming deployment. Chunked over
+    /// SQLite's variable limit; the input is normally in the hundreds.
+    pub fn filter_paths_targeted_by_deploy_ready(
+        &self,
+        library_paths: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        if library_paths.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        const CHUNK: usize = 900;
+        let mut found = HashSet::new();
+
+        for chunk in library_paths.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT library_name || '/' || deploy_path AS dest \
+                 FROM signal_deploy_ready \
+                 WHERE library_name != '' AND dest IN ({})",
+                placeholders,
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params_iter = rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str()));
+            let rows = stmt
+                .query_map(params_iter, |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            found.extend(rows);
+        }
+
+        Ok(found)
+    }
+
+    /// Deploy-ready counts grouped by library, sorted by name.
+    pub fn get_deploy_ready_counts_by_library(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT library_name, COUNT(*) \
+             FROM signal_deploy_ready \
+             GROUP BY library_name \
+             ORDER BY library_name",
+        )?;
+
+        let results = stmt
+            .query_map(params![], |row| {
+                let lib: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((lib, count as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    /// Deploy-ready counts grouped by corpus parent directory.
+    ///
+    /// The directory expression is the SQLite equivalent of
+    /// `Path::new(path).parent()`: `rtrim` strips trailing characters that
+    /// appear in the path's non-slash character set, which eats the final
+    /// segment and stops at the last `/`; the outer `substr` drops that
+    /// trailing separator. Paths with no `/` yield `""`, matching
+    /// `Path::parent()` on a bare filename.
+    ///
+    /// Aggregating in SQL keeps the deploy view off the ~500k-row full
+    /// materialization it used to do just to bucket rows by directory.
+    pub fn get_deploy_ready_counts_by_directory(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN INSTR(path, '/') = 0 THEN '' \
+                    ELSE SUBSTR(rtrim(path, REPLACE(path, '/', '')), 1, \
+                                LENGTH(rtrim(path, REPLACE(path, '/', ''))) - 1) \
+                    END AS dir, \
+                    COUNT(*) \
+             FROM signal_deploy_ready \
+             GROUP BY dir",
+        )?;
+
+        let results = stmt
+            .query_map(params![], |row| {
+                let dir: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((dir, count as usize))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 

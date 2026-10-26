@@ -35,10 +35,10 @@ deployment operations.
 | Stage | Order | Mutations |
 |-------|-------|-----------|
 | Config | 0 | ApplyConfigEdits, ApplyDirConfigEdit, ApplyBatchDirConfigEdits |
-| DB | 1 | ApplyTagOps (incl. genre promotion staging), AcknowledgeMtimeOnly, EmitCanonicalTag, EmitExpectedOverlap, EmitExpectedDuplicate, EmitExpectedMissingTag, IndexFileFromPath, UpdateFilePath, ApplyDbTagsToDisk, EditGenreVocabulary |
+| DB | 1 | ApplyTagOps (incl. genre promotion staging), AcknowledgeMtimeOnly, EmitCanonicalTag, EmitExpectedOverlap, EmitExpectedDuplicate, EmitExpectedMissingTag, IndexFileFromPath, UpdateFilePath, AcknowledgeMovedFiles, ResolveOobBucket, ApplyDbTagsToDisk, EditGenreVocabulary |
 | DiskFlush | 2 | Transcode, Move, StashFromZone, StashLeftovers, DropFromIndex, DropDirectoryFromIndex |
 | DiskDeploy | 3 | HardLink, LibraryMove |
-| *(ChainEmitted)* | — | FlushTagsToDisk, AssimilateDiskTagsToDb *(spawned during execution, never in transactions)* |
+| *(ChainEmitted)* | — | FlushTagsToDisk, AssimilateDiskTagsToDb *(spawned during execution, never in transactions)*. Note `ResolveOobBucket` also spawns AssimilateDiskTagsToDb, ApplyDbTagsToDisk, and AcknowledgeMtimeOnly as per-file children. |
 
 ---
 
@@ -105,6 +105,8 @@ Recovery process: Query `SELECT * FROM tracks WHERE needs_disk_flush = 1`, queue
 |----------|---------------------|-----------------|-----------------|-------|
 | UpdateFileEntry | UpdateCorpusFileSignals | — | (per-file signals wiped) | Update file entry in files table |
 | UpdateFilePath | — | — | MutableOnly scope signals for inode | Update path in files table; handles both absolute and relative new_path |
+| AcknowledgeMovedFiles | — | — | All same-zone `MovedFile` rows (bulk `DELETE`) | Applies every outstanding same-zone relocation to `inode_paths` in one `UPDATE`, then truncates those `signal_moved_file` rows. Carries no per-file payload — `observed_count` is advisory (for the decision label and review track count); the worker applies whatever is outstanding at execution time. Used instead of one `UpdateFilePath` per file because a corpus reorganization can produce hundreds of thousands of relocations. **Cross-zone moves are excluded** (they need tag-table migration) and remain for `UpdateFilePath` to handle per-file. **Note:** unlike per-file `UpdateFilePath` (`MutableOnly` scope per inode), this clears no per-inode signals — it reports no `affected_inodes`. Per-inode signals holding now-stale paths (e.g. `DeployReady.path`) are expected to self-heal via the `FILES \| TAGS` recomputation that re-derives them from `inode_paths`. |
+| ResolveOobBucket | — | — | None directly (each spawned child clears its own) | **Planner, not a worker.** Carries `bucket` + `action` (`ApplyDbToDisk`, `AssimilateDiskToDb`, `AcknowledgeMtime`) and no per-file payload. Does no file I/O: it walks the bucket by keyset cursor on `path` (reading only `(inode, path)`) and spawns **one per-file mutation per signal row** — the same `ApplyDbTagsToDisk` / `AssimilateDiskTagsToDb` / `AcknowledgeMtimeOnly` the OOB modal used to build client-side. Each child enqueues individually, so the progress screen counts N mutations down one at a time and a failure is scoped to its own file (its signal survives and resurfaces next pass) instead of stranding the bucket. Exists because the paginated OOB query means the client no longer holds the full bucket and cannot enumerate it — the fan-out moved below the protocol boundary, not away. `observed_count` is advisory (decision label + review track count); the walk covers whatever is outstanding at execution time. Reports no `affected_inodes` and `RecomputationScope::EMPTY` — each child declares its own. |
 | CleanupStaleFiles | — | — | — | Remove orphaned file entries |
 
 ### File Operations
@@ -132,6 +134,8 @@ Recovery process: Query `SELECT * FROM tracks WHERE needs_disk_flush = 1`, queue
 | AcknowledgeInodeChanged | UpdateCorpusFileSignals | — | InodeChanged | Update tracks.inode and files table for replaced files |
 
 Note: ApplyDbTagsToDisk and AssimilateDiskTagsToDb are now single-track mutations documented in Tag Operations above. They clear OutOfBandTagSync, OutOfBandTagConflict, and tag_mismatch signals.
+
+Note: `ResolveOobBucket` fans out into these three rather than replacing them. The OOB modal stages it whenever the operator has made no explicit per-file selection, which is the default — a selection can only name rows in the page currently loaded, so enumerating "everything" client-side would silently mean "everything visible". With a selection, the per-file mutations above are staged directly. Either way the unit of work that reaches the queue is one mutation per track edit.
 
 ### External Match Operations
 

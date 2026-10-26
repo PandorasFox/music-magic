@@ -347,8 +347,10 @@ export interface LibrarySummary {
 }
 
 export interface DeployModalData {
-  healthy: DeploySignalFile[];
-  new: DeploySignalFile[];
+  healthy_count: number;
+  healthy_by_library: [string, number][];
+  new_count: number;
+  new_by_library: [string, number][];
   new_by_dir: DirectoryAggregate[];
   conflicts: ConflictGroup[];
   leftover: LeftoverSignalFile[];
@@ -444,6 +446,12 @@ export interface MovedFileInfo {
   new_zone: string;
 }
 
+/** Count plus a bounded display sample; the full list is never sent. */
+export interface MovedFileSummary {
+  total: number;
+  sample: MovedFileInfo[];
+}
+
 export interface TagMismatchEntry {
   field: string;
   db_value: string | null;
@@ -455,6 +463,15 @@ export interface OobFile {
   path: string;
   bucket: ConflictBucket;
   mismatches: TagMismatchEntry[];
+}
+
+export interface OobSummary {
+  /** Totals for every bucket, ordered MtimeOnly, DbOnly, DiskOnly, Conflict. */
+  counts: [number, number, number, number];
+  bucket: ConflictBucket;
+  offset: number;
+  /** A bounded window of `bucket`, not the whole set. */
+  files: OobFile[];
 }
 
 // -- Directory cluster resolution --

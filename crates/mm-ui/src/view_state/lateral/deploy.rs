@@ -48,7 +48,9 @@ impl DeployViewData {
             DeployViewData::UpToDate { .. } => 0,
             DeployViewData::Preview { cached_data } => {
                 let count = match active_tab {
-                    DeployTab::Healthy => cached_data.healthy.len(),
+                    // Healthy is a summary view: one row per library, and the
+                    // per-library rows aren't individually selectable.
+                    DeployTab::Healthy => 0,
                     DeployTab::New => cached_data.new_by_dir.len(),
                     DeployTab::Conflicts => cached_data.conflicts.len(),
                     DeployTab::Leftover => cached_data.leftover_by_dir.len(),
@@ -62,7 +64,7 @@ impl DeployViewData {
 
 /// Determine which tab to start on based on data content.
 pub fn initial_tab(cached_data: &DeployModalData) -> DeployTab {
-    if !cached_data.new.is_empty() {
+    if cached_data.new_count > 0 {
         DeployTab::New
     } else {
         DeployTab::Healthy
@@ -76,10 +78,11 @@ pub fn selected_path_static(
     scroll: usize,
 ) -> Option<&str> {
     match active_tab {
-        DeployTab::Healthy => cached_data
-            .healthy
-            .get(scroll)
-            .map(|f| f.corpus_path.as_str()),
+        // Healthy tab is a summary — no per-item selection.
+        DeployTab::Healthy => {
+            let _ = scroll;
+            None
+        }
         DeployTab::New => cached_data
             .new_by_dir
             .get(scroll)

@@ -408,11 +408,11 @@ pub async fn stage_deploy(
     State(state): State<AppState>,
     BearerToken(token): BearerToken,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use mm_meta::domain_queries::GetDeployData;
+    use mm_meta::domain_queries::{GetDeployData, GetDeployReadyFiles};
     use mm_meta::paths::PathResolver;
     use mm_ui::deploy::prepare_deploy_decisions;
 
-    // 1. Load deploy data.
+    // 1. Load deploy data (counts only).
     let deploy_resp = super::queries::send_query(
         &state, token.clone(), GetDeployData.into_payload(),
     ).await?;
@@ -422,6 +422,13 @@ pub async fn stage_deploy(
     if total == 0 {
         return Err(ApiError::BadRequest("no deploy operations to stage".into()));
     }
+
+    // 1b. Fetch the per-file deploy-ready list. Kept out of GetDeployData so
+    // opening the view does not pay for it — only committing does.
+    let new_files_resp = super::queries::send_query(
+        &state, token.clone(), GetDeployReadyFiles.into_payload(),
+    ).await?;
+    let new_files = GetDeployReadyFiles::extract_response(new_files_resp);
 
     // 2. Load config for PathResolver.
     let config_resp = super::queries::send_query(
@@ -434,7 +441,7 @@ pub async fn stage_deploy(
     let resolver = PathResolver::from_config(&config);
 
     // 3. Build decisions server-side.
-    let prepared = prepare_deploy_decisions(&deploy_data, &resolver);
+    let prepared = prepare_deploy_decisions(&deploy_data, &new_files, &resolver);
 
     if prepared.decisions.is_empty() {
         return Err(ApiError::BadRequest(format!(

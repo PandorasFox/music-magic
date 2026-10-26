@@ -13,6 +13,12 @@ impl HandleAction for oob_conflict_modal::OobAction {
     fn handle(self, app: &mut App, witness: Option<&witness::ConfirmationGesture>) {
         use mm_ui::resolutions::dispatch::{Dispatchable, DispatchResult};
 
+        // The page belongs to whichever bucket was active when it was fetched.
+        if self == oob_conflict_modal::OobAction::BucketChanged {
+            app.reload_oob_bucket();
+            return;
+        }
+
         let result = {
             let ActiveView::OobResolution(ref state) = app.view else {
                 return;
@@ -87,19 +93,35 @@ impl HandleAction for moved_file_modal::MovedFileAction {
 
 impl App {
     pub(crate) fn start_oob_conflict_inspection(&mut self) {
-        let files = self.query(mm_meta::domain_queries::GetOobFiles { bucket: None });
+        let summary = self.query(mm_meta::domain_queries::GetOobSummary::first_page());
         let _ = self.start_transaction("OOB tag resolution");
-        let state = oob_conflict_modal::OobResolutionState::new(files);
+        let state = oob_conflict_modal::OobResolutionState::new(summary);
         self.view = ActiveView::OobResolution(state);
     }
 
+    /// Re-query the active bucket after a tab switch.
+    ///
+    /// Only one bucket's page is ever held, so changing tabs means fetching
+    /// the new one rather than reading it out of memory.
+    pub(crate) fn reload_oob_bucket(&mut self) {
+        let ActiveView::OobResolution(ref state) = self.view else {
+            return;
+        };
+        let summary = self.query(mm_meta::domain_queries::GetOobSummary::bucket(
+            state.active_bucket,
+        ));
+        if let ActiveView::OobResolution(ref mut state) = self.view {
+            state.set_page(summary);
+        }
+    }
+
     pub(crate) fn start_moved_file_acknowledge(&mut self) {
-        let files = self.query(mm_meta::domain_queries::GetMovedFiles);
+        let summary = self.query(mm_meta::domain_queries::GetMovedFiles);
         mm_meta::logging::log_general(format!(
-            "Starting moved file acknowledgement: {} files", files.len()
+            "Starting moved file acknowledgement: {} files", summary.total
         ));
         let _ = self.start_transaction("Moved file acknowledgement");
-        let state = moved_file_modal::MovedFileState::new(moved_file_modal::MovedFileData { files });
+        let state = moved_file_modal::MovedFileState::new(moved_file_modal::MovedFileData { summary });
         self.view = ActiveView::MovedFileAcknowledge(state);
     }
 }

@@ -23,6 +23,64 @@ pub struct UpdateFilePathMutation {
     pub new_zone: Option<String>,
 }
 
+/// Acknowledge every outstanding same-zone relocation in one operation.
+///
+/// Relocations are acknowledged wholesale, and a corpus reorganization can
+/// produce hundreds of thousands of them; one `UpdateFilePath` per file would
+/// mean an equally large decision payload and minutes of write-thread time.
+/// This mutation carries no per-file data — the worker applies the whole
+/// `signal_moved_file` table in bulk SQL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcknowledgeMovedFilesMutation {
+    /// Count observed when the operator confirmed, for the decision label.
+    /// Advisory only: the worker applies whatever is outstanding at run time.
+    pub observed_count: usize,
+}
+
+/// Which way an OOB bucket is resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OobBucketAction {
+    /// Indexed tags win — rewrite the files on disk to match the DB.
+    ApplyDbToDisk,
+    /// The files win — reindex the DB from the tags on disk.
+    AssimilateDiskToDb,
+    /// Nothing to reconcile; record that the mtime change was seen.
+    AcknowledgeMtime,
+}
+
+impl OobBucketAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ApplyDbToDisk => "Apply DB tags \u{2192} files",
+            Self::AssimilateDiskToDb => "Assimilate file tags \u{2192} DB",
+            Self::AcknowledgeMtime => "Acknowledge mtime changes",
+        }
+    }
+}
+
+/// Resolve every outstanding OOB signal in one bucket, in one operation.
+///
+/// A bulk tag rewrite can leave hundreds of thousands of files out of band, so
+/// this carries the bucket rather than its rows: one mutation per file would
+/// mean a decision payload the size of the corpus and a transaction the review
+/// screen cannot render. The worker re-reads the bucket at execution time and
+/// walks it itself.
+///
+/// Per-file work is unavoidable underneath — assimilation reads tags off each
+/// file and application writes them back — but that stays server-side instead
+/// of round-tripping through the operator's client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolveOobBucketMutation {
+    /// Which bucket to drain.
+    pub bucket: crate::views::ConflictBucket,
+    /// Which direction to resolve it.
+    pub action: OobBucketAction,
+    /// Count observed when the operator confirmed, for the decision label.
+    /// Advisory only: the worker resolves whatever is outstanding at run time,
+    /// which on a live corpus will have drifted since the modal was opened.
+    pub observed_count: usize,
+}
+
 /// Drop file from index (for missing files or orphaned signals).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DropFromIndexMutation {
@@ -137,6 +195,30 @@ impl UpdateFilePathMutation {
             ));
         }
         entries
+    }
+}
+
+impl AcknowledgeMovedFilesMutation {
+    pub fn diff_entries(&self) -> Vec<DiffEntry> {
+        vec![DiffEntry::new(
+            "relocations",
+            format!("{} unacknowledged", self.observed_count),
+            "paths updated, signals cleared",
+        )]
+    }
+}
+
+impl ResolveOobBucketMutation {
+    pub fn diff_entries(&self) -> Vec<DiffEntry> {
+        vec![DiffEntry::new(
+            self.bucket.label(),
+            format!("{} out of band", self.observed_count),
+            match self.action {
+                OobBucketAction::ApplyDbToDisk => "files rewritten from index",
+                OobBucketAction::AssimilateDiskToDb => "index rebuilt from files",
+                OobBucketAction::AcknowledgeMtime => "mtime accepted, signals cleared",
+            },
+        )]
     }
 }
 

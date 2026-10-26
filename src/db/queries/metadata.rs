@@ -9,6 +9,63 @@ use super::Database;
 /// (album, artist_context, isrc, catalog_number, year, date, mb_release_id).
 pub type AlbumCollisionRow = (String, String, String, String, String, String, String);
 
+// ============================================================================
+// OOB signal classification
+// ============================================================================
+//
+// A sync signal's resolution bucket is not a column — it is implied by which
+// side of the diff carries the extras. Counting and paging both need the same
+// rule, so it lives here once rather than being restated per query.
+
+/// Decode a signal blob into mismatch entries.
+///
+/// A blob that fails to decode yields no entries, which classifies as
+/// `DiskOnly` — the same fallback the OOB modal has always shown for an
+/// unreadable signal.
+fn decode_mismatches(blob: &[u8]) -> Vec<crate::meta::signals::data::TagMismatchEntry> {
+    bincode::deserialize(blob).unwrap_or_default()
+}
+
+/// Classify a sync signal by the direction its extras point.
+///
+/// `VerifyTags` routes mixed-direction diffs to `signal_oob_tag_conflict`, so
+/// `Conflict` is not expected here; it is returned rather than assumed away so
+/// a stray row is counted somewhere rather than vanishing from the totals.
+fn classify_sync(
+    mismatches: &[crate::meta::signals::data::TagMismatchEntry],
+) -> crate::meta::views::ConflictBucket {
+    use crate::meta::views::ConflictBucket;
+
+    let all_db_null = mismatches.iter().all(|m| m.db_value.is_none());
+    let all_disk_null = mismatches.iter().all(|m| m.disk_value.is_none());
+    if all_db_null {
+        ConflictBucket::DiskOnly
+    } else if all_disk_null {
+        ConflictBucket::DbOnly
+    } else {
+        ConflictBucket::Conflict
+    }
+}
+
+/// Classify a sync signal straight from its stored blob.
+fn classify_sync_blob(blob: &[u8]) -> crate::meta::views::ConflictBucket {
+    classify_sync(&decode_mismatches(blob))
+}
+
+/// Convert signal-level mismatches to view-level mismatches.
+fn to_view_mismatches(
+    typed: Vec<crate::meta::signals::data::TagMismatchEntry>,
+) -> Vec<crate::meta::views::TagMismatchEntry> {
+    typed
+        .into_iter()
+        .map(|m| crate::meta::views::TagMismatchEntry {
+            field: m.tag_name,
+            db_value: m.db_value,
+            disk_value: m.disk_value,
+        })
+        .collect()
+}
+
 impl Database {
     // ========================================================================
     // Tag Collision Detection Queries (for canonicalization signals)
@@ -303,128 +360,240 @@ impl Database {
     // OOB Tag Resolution Queries
     // ========================================================================
 
-    /// Get ALL OOB signal files classified into resolution buckets.
+    /// Count OOB signal files per resolution bucket.
     ///
-    /// Reads from typed tables and classifies by mismatch direction.
-    /// - Bucket 0 (MtimeOnly): mtime_only_mismatch signal
-    /// - Bucket 1 (DbOnly): all mismatches have disk_value NULL
-    /// - Bucket 2 (DiskOnly): all mismatches have db_value NULL
-    /// - Bucket 3 (Conflict): mismatches in both directions
-    pub fn get_oob_files_bucketed(&self) -> Result<Vec<crate::meta::views::OobFile>> {
-        use crate::meta::signals::data::TagMismatchEntry as TypedEntry;
-        use crate::meta::views::{OobFile, ConflictBucket, TagMismatchEntry};
+    /// Counts only — no paths, no row materialization. `signal_mtime_only_mismatch`
+    /// and `signal_oob_tag_conflict` map one-to-one onto a bucket, so those are
+    /// plain `COUNT(*)`. A sync signal's bucket is a property of its blob (which
+    /// direction carries the extras), so those rows are streamed and classified;
+    /// at ~140k rows / 25 MB that scan is well under a second.
+    ///
+    /// No join against `inode_paths`. OOB signals are corpus-only by
+    /// construction — `VerifyTags` emits them for corpus inodes and
+    /// `drop_stale_corpus_signal` clears them the same way — so the zone filter
+    /// excluded nothing (measured: 435,489 rows in, 435,490 out) while
+    /// dominating runtime, and it double-counted inodes hardlinked into more
+    /// than one corpus path.
+    pub fn get_oob_bucket_counts(&self) -> Result<[usize; 4]> {
+        use crate::meta::views::ConflictBucket;
 
-        /// Convert signal-level mismatches to view-level mismatches.
-        fn to_view_mismatches(typed: Vec<TypedEntry>) -> Vec<TagMismatchEntry> {
-            typed
-                .into_iter()
-                .map(|m| TagMismatchEntry {
-                    field: m.tag_name,
-                    db_value: m.db_value,
-                    disk_value: m.disk_value,
-                })
-                .collect()
+        let mut counts = [0usize; 4];
+
+        counts[ConflictBucket::MtimeOnly.index()] = self.conn.query_row(
+            "SELECT COUNT(*) FROM signal_mtime_only_mismatch",
+            params![],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+
+        counts[ConflictBucket::Conflict.index()] = self.conn.query_row(
+            "SELECT COUNT(*) FROM signal_oob_tag_conflict",
+            params![],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+
+        // Sync rows carry their direction inside the blob — stream and tally.
+        let mut stmt = self.conn.prepare("SELECT data FROM signal_oob_tag_sync")?;
+        let rows = stmt.query_map(params![], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            counts[classify_sync_blob(&row?).index()] += 1;
         }
 
-        let mut files = Vec::new();
-
-        // MtimeOnly signals — no tag mismatches
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT s.inode, s.path FROM signal_mtime_only_mismatch s
-                 INNER JOIN inode_paths p ON p.inode = s.inode AND p.zone = 'corpus'
-                 ORDER BY s.path",
-            )?;
-            let rows = stmt.query_map(params![], |row| {
-                Ok(OobFile {
-                    inode: row.get(0)?,
-                    path: row.get(1)?,
-                    bucket: ConflictBucket::MtimeOnly,
-                    mismatches: Vec::new(),
-                })
-            })?;
-            for row in rows {
-                files.push(row?);
-            }
-        }
-
-        // OOB tag sync signals — carry mismatches, infer direction bucket
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT s.inode, s.path, s.data FROM signal_oob_tag_sync s
-                 INNER JOIN inode_paths p ON p.inode = s.inode AND p.zone = 'corpus'
-                 ORDER BY s.path",
-            )?;
-            let rows = stmt.query_map(params![], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (inode, path, blob) = row?;
-                let typed: Vec<TypedEntry> = bincode::deserialize(&blob).unwrap_or_default();
-                let all_db_null = typed.iter().all(|m| m.db_value.is_none());
-                let all_disk_null = typed.iter().all(|m| m.disk_value.is_none());
-                let bucket = if all_db_null {
-                    ConflictBucket::DiskOnly
-                } else if all_disk_null {
-                    ConflictBucket::DbOnly
-                } else {
-                    ConflictBucket::Conflict
-                };
-                files.push(OobFile {
-                    inode,
-                    path,
-                    bucket,
-                    mismatches: to_view_mismatches(typed),
-                });
-            }
-        }
-
-        // OOB tag conflict signals — always Conflict bucket, carry mismatches
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT s.inode, s.path, s.data FROM signal_oob_tag_conflict s
-                 INNER JOIN inode_paths p ON p.inode = s.inode AND p.zone = 'corpus'
-                 ORDER BY s.path",
-            )?;
-            let rows = stmt.query_map(params![], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (inode, path, blob) = row?;
-                let typed: Vec<TypedEntry> = bincode::deserialize(&blob).unwrap_or_default();
-                files.push(OobFile {
-                    inode,
-                    path,
-                    bucket: ConflictBucket::Conflict,
-                    mismatches: to_view_mismatches(typed),
-                });
-            }
-        }
-
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
+        Ok(counts)
     }
 
-    /// Get files with MovedFile signals (same inode, different path).
+    /// Read one ordered page of a single OOB bucket.
     ///
-    /// Reads from typed signal_moved_file table: inode, path (new), old_path, zones.
-    pub fn get_moved_files(&self) -> Result<Vec<crate::meta::views::MovedFileInfo>> {
-        use crate::meta::views::MovedFileInfo;
+    /// Bounded by `limit`: the modal renders bucket counts, one scrolled
+    /// window, and the cursor file's mismatches, so the full set is never
+    /// needed for display. Bulk resolution acts on the whole bucket
+    /// server-side rather than on a client-held list of rows.
+    ///
+    /// Ordering is by path within the backing table. Blobs are deserialized
+    /// only for rows that land in the returned page.
+    pub fn get_oob_bucket_page(
+        &self,
+        bucket: crate::meta::views::ConflictBucket,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<crate::meta::views::OobFile>> {
+        use crate::meta::views::{ConflictBucket, OobFile};
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        match bucket {
+            // One row per signal — the bucket filter is the table itself, so
+            // LIMIT/OFFSET pushes all the way down to SQLite.
+            ConflictBucket::MtimeOnly => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT inode, path FROM signal_mtime_only_mismatch \
+                     ORDER BY path LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+                    Ok(OobFile {
+                        inode: row.get(0)?,
+                        path: row.get(1)?,
+                        bucket: ConflictBucket::MtimeOnly,
+                        mismatches: Vec::new(),
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            }
+            ConflictBucket::Conflict => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT inode, path, data FROM signal_oob_tag_conflict \
+                     ORDER BY path LIMIT ?1 OFFSET ?2",
+                )?;
+                let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+                let mut files = Vec::new();
+                for row in rows {
+                    let (inode, path, blob) = row?;
+                    files.push(OobFile {
+                        inode,
+                        path,
+                        bucket: ConflictBucket::Conflict,
+                        mismatches: to_view_mismatches(decode_mismatches(&blob)),
+                    });
+                }
+                Ok(files)
+            }
+            // Direction lives in the blob, so SQLite cannot do the filtering:
+            // walk the sync table in path order and keep the matching window.
+            ConflictBucket::DbOnly | ConflictBucket::DiskOnly => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT inode, path, data FROM signal_oob_tag_sync ORDER BY path")?;
+                let rows = stmt.query_map(params![], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+
+                let mut seen = 0usize;
+                let mut files = Vec::with_capacity(limit.min(1024));
+                for row in rows {
+                    let (inode, path, blob) = row?;
+                    let typed = decode_mismatches(&blob);
+                    if classify_sync(&typed) != bucket {
+                        continue;
+                    }
+                    seen += 1;
+                    if seen <= offset {
+                        continue;
+                    }
+                    files.push(OobFile {
+                        inode,
+                        path,
+                        bucket,
+                        mismatches: to_view_mismatches(typed),
+                    });
+                    if files.len() >= limit {
+                        break;
+                    }
+                }
+                Ok(files)
+            }
+        }
+    }
+
+    /// Walk a bucket's `(inode, relative_path)` entries for bulk resolution.
+    ///
+    /// Keyset pagination, not `OFFSET`: bulk resolution clears signals as it
+    /// goes, and those clears land through the write thread asynchronously, so
+    /// row positions shift under an offset-based cursor mid-walk. Ordering by
+    /// path and resuming strictly after the last path seen is stable whether or
+    /// not the rows behind the cursor have been deleted yet.
+    ///
+    /// Carries no mismatch data — bulk resolution re-reads each file rather
+    /// than trusting a diff captured when the signal was emitted.
+    pub fn get_oob_bucket_entries(
+        &self,
+        bucket: crate::meta::views::ConflictBucket,
+        after_path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        use crate::meta::views::ConflictBucket;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let after = after_path.unwrap_or("");
+
+        let table = match bucket {
+            ConflictBucket::MtimeOnly => "signal_mtime_only_mismatch",
+            ConflictBucket::Conflict => "signal_oob_tag_conflict",
+            ConflictBucket::DbOnly | ConflictBucket::DiskOnly => "signal_oob_tag_sync",
+        };
+
+        match bucket {
+            ConflictBucket::MtimeOnly | ConflictBucket::Conflict => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT inode, path FROM {table} WHERE path > ?1 ORDER BY path LIMIT ?2"
+                ))?;
+                let rows = stmt.query_map(params![after, limit as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+            }
+            // Direction lives in the blob, so the filter cannot go into SQL —
+            // scan forward from the cursor and keep the matching rows.
+            ConflictBucket::DbOnly | ConflictBucket::DiskOnly => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT inode, path, data FROM {table} WHERE path > ?1 ORDER BY path"
+                ))?;
+                let rows = stmt.query_map(params![after], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+                let mut out = Vec::with_capacity(limit.min(1024));
+                for row in rows {
+                    let (inode, path, blob) = row?;
+                    if classify_sync_blob(&blob) != bucket {
+                        continue;
+                    }
+                    out.push((inode, path));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Summarize files with MovedFile signals (same inode, different path).
+    ///
+    /// Returns a total count plus a bounded sample. The full list is never
+    /// loaded for display: acknowledgement is all-or-nothing and applies as a
+    /// single bulk mutation, so nothing downstream needs the per-file rows.
+    pub fn get_moved_file_summary(&self) -> Result<crate::meta::views::MovedFileSummary> {
+        use crate::meta::views::{MovedFileInfo, MovedFileSummary};
+
+        let total: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM signal_moved_file", params![], |r| {
+                    r.get(0)
+                })?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT inode, old_path, path, old_zone, new_zone FROM signal_moved_file ORDER BY path",
+            "SELECT inode, old_path, path, old_zone, new_zone \
+             FROM signal_moved_file ORDER BY path LIMIT ?1",
         )?;
 
-        let files: Vec<MovedFileInfo> = stmt
-            .query_map(params![], |row| {
+        let sample: Vec<MovedFileInfo> = stmt
+            .query_map(params![MovedFileSummary::SAMPLE_LIMIT as i64], |row| {
                 Ok(MovedFileInfo {
                     inode: row.get(0)?,
                     old_path: row.get(1)?,
@@ -436,7 +605,10 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
 
-        Ok(files)
+        Ok(MovedFileSummary {
+            total: total as usize,
+            sample,
+        })
     }
 
 }

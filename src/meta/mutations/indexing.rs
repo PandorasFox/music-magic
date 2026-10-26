@@ -29,7 +29,8 @@ use super::types::{
 
 // Re-export struct definitions from mm-meta
 pub use mm_meta::mutations::indexing::{
-    AcknowledgeMtimeOnlyMutation, ApplyDbTagsToDiskMutation, AssimilateDiskTagsToDbMutation,
+    AcknowledgeMovedFilesMutation, AcknowledgeMtimeOnlyMutation, ApplyDbTagsToDiskMutation,
+    AssimilateDiskTagsToDbMutation, OobBucketAction, ResolveOobBucketMutation,
     DropDirectoryFromIndexMutation, DropExternalMatchMutation, DropFromIndexMutation,
     EmitCanonicalTagMutation, EmitExpectedDuplicateMutation, EmitExpectedMissingTagMutation,
     EmitExpectedOverlapMutation, FlushTagsToDiskMutation, IndexFileFromPathMutation,
@@ -173,6 +174,70 @@ impl_mutation_executor!(
     ),
     affected_inodes: |s| vec![s.inode],
 );
+
+impl_mutation_executor!(
+    AcknowledgeMovedFilesMutation, AcknowledgeMovedFiles,
+    origin: super::MutationOrigin::Staged,
+    execution_stage: super::MutationExecutionStage::DB,
+    signal_clear_scope: SignalClearScope::None,
+    recomputation_scope: RecomputationScope::FILES | RecomputationScope::TAGS,
+    execute: |_s, ctx| execute_acknowledge_moved_files(ctx.witness),
+    affected_inodes: |_s| Vec::new(),
+);
+
+/// Plans the bucket; does no per-file work itself.
+///
+/// Hand-written rather than via `impl_mutation_executor!` because that macro
+/// funnels through `MutationResult::from_unit_result`, which cannot carry
+/// spawned mutations — and spawning is the entire point of this one.
+///
+/// Reports no `affected_inodes`: the set is whatever the bucket holds at
+/// execution time, which is precisely what this mutation exists to avoid
+/// enumerating up front. Each spawned child reports its own inode and clears
+/// its own signals.
+impl MutationExecutor for ResolveOobBucketMutation {
+    fn origin(&self) -> super::MutationOrigin {
+        super::MutationOrigin::Staged
+    }
+    fn execution_stage(&self) -> super::MutationExecutionStage {
+        super::MutationExecutionStage::DB
+    }
+
+    fn execute(&self, ctx: &MutationContext) -> MutationResult {
+        let start = std::time::Instant::now();
+        let (result, spawn_mutations) =
+            match plan_resolve_oob_bucket(ctx.read_db, self.bucket, self.action, ctx.witness) {
+                Ok(spawned) => (Ok(()), spawned),
+                Err(e) => (Err(e), Vec::new()),
+            };
+        let (success, error) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(format!("{:#}", e))),
+        };
+
+        MutationResult {
+            _mutation: Mutation::ResolveOobBucket(self.clone()),
+            success,
+            error,
+            _duration_ms: start.elapsed().as_millis() as u64,
+            spawn_mutations,
+            pending_signals: Vec::new(),
+            discovered_inodes: Vec::new(),
+        }
+    }
+
+    fn signal_clear_scope(&self) -> SignalClearScope {
+        SignalClearScope::None
+    }
+
+    fn affected_inodes(&self) -> Vec<i64> {
+        Vec::new()
+    }
+
+    fn recomputation_scope(&self) -> RecomputationScope {
+        RecomputationScope::EMPTY
+    }
+}
 
 impl_mutation_executor!(
     DropFromIndexMutation, DropFromIndex,
@@ -474,6 +539,95 @@ pub fn execute_update_file_path(
     );
 
     Ok(())
+}
+
+/// Execute AcknowledgeMovedFiles mutation — apply every outstanding same-zone
+/// relocation and clear those signals, as one bulk write op.
+///
+/// Carries no per-file payload: the worker reads `signal_moved_file` directly,
+/// so whatever is outstanding at execution time is what gets applied.
+pub fn execute_acknowledge_moved_files(witness: &MutationExecutionWitness) -> Result<()> {
+    use crate::db::write_thread;
+
+    let sender = write_thread::require_sender()?;
+    sender.apply_all_moved_file_paths(witness);
+
+    Ok(())
+}
+
+/// Plan a bucket resolution: one spawned mutation per outstanding signal.
+///
+/// Does no file I/O. It walks the bucket by keyset cursor — cheap, since only
+/// `(inode, path)` is read — and emits a per-file mutation for each row. Those
+/// land in the Witch's queue individually and dispatch across the Hades pool,
+/// so a 500k-file bucket resolves with the whole pool busy rather than one
+/// worker grinding through it serially.
+///
+/// The operator still sees one decision and one transaction entry; the fan-out
+/// happens entirely below the protocol boundary.
+///
+/// Per-file failures are handled by the spawned mutations themselves: a file
+/// that fails leaves its signal in place and resurfaces next pass, without
+/// affecting its siblings. Only planning errors surface here.
+fn plan_resolve_oob_bucket(
+    db: &ReadOnlyDb<'_>,
+    bucket: mm_meta::views::ConflictBucket,
+    action: OobBucketAction,
+    witness: &MutationExecutionWitness,
+) -> Result<Vec<crate::witch::SpawnedMutation>> {
+    use mm_meta::db_types::Zone;
+
+    /// Rows per cursor step. Bounds the working set of the walk itself; every
+    /// row still gets its own mutation.
+    const STEP: usize = 4096;
+
+    let resolver = crate::corpus::paths::get_resolver();
+    let mut cursor: Option<String> = None;
+    let mut spawned = Vec::new();
+
+    loop {
+        let entries = db.get_oob_bucket_entries(bucket, cursor.as_deref(), STEP)?;
+        if entries.is_empty() {
+            break;
+        }
+        cursor = entries.last().map(|(_, path)| path.clone());
+
+        for (inode, rel_path) in entries {
+            let path = resolver.resolve_for_zone(Zone::Corpus, std::path::Path::new(&rel_path));
+
+            let mutation = match action {
+                OobBucketAction::ApplyDbToDisk => {
+                    Mutation::ApplyDbTagsToDisk(ApplyDbTagsToDiskMutation {
+                        inode,
+                        path,
+                        zone: Zone::Corpus,
+                    })
+                }
+                OobBucketAction::AssimilateDiskToDb => {
+                    Mutation::AssimilateDiskTagsToDb(AssimilateDiskTagsToDbMutation {
+                        inode,
+                        path,
+                        zone: None,
+                    })
+                }
+                OobBucketAction::AcknowledgeMtime => {
+                    Mutation::AcknowledgeMtimeOnly(AcknowledgeMtimeOnlyMutation {
+                        tracks: vec![(inode, path)],
+                    })
+                }
+            };
+            spawned.push(witness.spawn_mutation(mutation));
+        }
+    }
+
+    crate::logging::log_general(format!(
+        "[MUTATION] ResolveOobBucket: {:?} via {} — fanned out {} mutations",
+        bucket,
+        action.label(),
+        spawned.len()
+    ));
+
+    Ok(spawned)
 }
 
 /// Execute DropDirectoryFromIndex mutation - remove directory and contents from index.

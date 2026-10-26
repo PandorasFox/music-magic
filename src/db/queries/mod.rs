@@ -591,8 +591,18 @@ impl<'a> ReadOnlyDb<'a> {
     // =========================================================================
 
     delegate_read! {
-        fn get_oob_files_bucketed() -> Result<Vec<crate::meta::views::OobFile>>;
-        fn get_moved_files() -> Result<Vec<crate::meta::views::MovedFileInfo>>;
+        fn get_oob_bucket_counts() -> Result<[usize; 4]>;
+        fn get_oob_bucket_page(
+            bucket: crate::meta::views::ConflictBucket,
+            offset: usize,
+            limit: usize
+        ) -> Result<Vec<crate::meta::views::OobFile>>;
+        fn get_oob_bucket_entries(
+            bucket: crate::meta::views::ConflictBucket,
+            after_path: Option<&str>,
+            limit: usize
+        ) -> Result<Vec<(i64, String)>>;
+        fn get_moved_file_summary() -> Result<crate::meta::views::MovedFileSummary>;
     }
 
     // =========================================================================
@@ -601,7 +611,11 @@ impl<'a> ReadOnlyDb<'a> {
 
     delegate_read! {
         fn get_deploy_ready_files() -> Result<Vec<crate::meta::views::DeploySignalFile>>;
-        fn get_deployed_healthy_files() -> Result<Vec<crate::meta::views::DeploySignalFile>>;
+        fn get_deployed_healthy_counts() -> Result<Vec<(String, usize)>>;
+        fn get_superseded_healthy() -> Result<Vec<crate::meta::views::LeftoverSignalFile>>;
+        fn filter_paths_targeted_by_deploy_ready(library_paths: &[String]) -> Result<std::collections::HashSet<String>>;
+        fn get_deploy_ready_counts_by_library() -> Result<Vec<(String, usize)>>;
+        fn get_deploy_ready_counts_by_directory() -> Result<Vec<(String, usize)>>;
         fn get_library_stale_files() -> Result<Vec<crate::meta::views::StaleSignalFile>>;
         fn get_library_leftover_files() -> Result<Vec<crate::meta::views::LeftoverSignalFile>>;
         fn get_deploy_conflict_groups() -> Result<Vec<crate::meta::views::ConflictGroup>>;

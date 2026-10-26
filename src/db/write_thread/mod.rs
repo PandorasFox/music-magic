@@ -183,6 +183,14 @@ enum DbWriteOp {
         clear_fn: fn(&rusqlite::Connection) -> rusqlite::Result<usize>,
         label: &'static str,
     },
+    /// Apply every outstanding same-zone MovedFile relocation to
+    /// `inode_paths` in one statement, then truncate `signal_moved_file`.
+    ///
+    /// Bulk because a corpus reorganization produces relocations by the
+    /// hundred thousand; one `DbWriteOp` per file would saturate this thread
+    /// for minutes. Cross-zone moves are excluded — they need tag migration
+    /// and are handled per-file by `UpdateFilePath`.
+    ApplyAllMovedFilePaths,
 
     // =========================================================================
     // Library File Operations
@@ -550,6 +558,7 @@ impl DbWriteOp {
             DbWriteOp::ClearAggregateSignalByKey { .. } => "ClearAggregateSignalByKey",
             DbWriteOp::ClearAggregateByKeyPrefix { .. } => "ClearAggregateByKeyPrefix",
             DbWriteOp::ClearSignalTable { .. } => "ClearSignalTable",
+            DbWriteOp::ApplyAllMovedFilePaths => "ApplyAllMovedFilePaths",
             DbWriteOp::UpsertLibraryFile { .. } => "UpsertLibraryFile",
             DbWriteOp::DeleteLibraryFile { .. } => "DeleteLibraryFile",
             DbWriteOp::WriteTypedSignal { .. } => "WriteTypedSignal",

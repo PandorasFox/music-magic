@@ -118,7 +118,7 @@ macro_rules! impl_domain_query {
 
 use crate::meta::views::{
     DeployStatus, ExternalMatchesData,
-    InsightsData, MovedFileInfo, OobFile,
+    InsightsData, MovedFileSummary, OobSummary,
 };
 
 use crate::db::modal_loaders;
@@ -171,17 +171,30 @@ impl_domain_query! {
 // ============================================================================
 
 impl_domain_query! {
-    GetOobFiles => Vec<OobFile>, |s, db| {
-        let all = db.get_oob_files_bucketed().unwrap_or_default();
-        match s.bucket {
-            Some(bucket) => all.into_iter().filter(|f| f.bucket == bucket).collect(),
-            None => all,
-        }
+    GetOobSummary => OobSummary, |s, db| {
+        use mm_meta::views::ConflictBucket;
+
+        let counts = db.get_oob_bucket_counts().unwrap_or_default();
+
+        // Cold open lands on the first bucket that has anything in it, so the
+        // modal never greets the operator with an empty tab.
+        let bucket = s.bucket.unwrap_or_else(|| {
+            ConflictBucket::ALL
+                .into_iter()
+                .find(|b| counts[b.index()] > 0)
+                .unwrap_or(ConflictBucket::MtimeOnly)
+        });
+
+        let files = db
+            .get_oob_bucket_page(bucket, s.offset, s.limit)
+            .unwrap_or_default();
+
+        OobSummary { counts, bucket, offset: s.offset, files }
     }
 }
 
 impl_domain_query! {
-    GetMovedFiles => Vec<MovedFileInfo>, db.get_moved_files()
+    GetMovedFiles => MovedFileSummary, db.get_moved_file_summary()
 }
 
 impl_domain_query! {
@@ -366,6 +379,12 @@ impl_domain_query! {
     GetDeployData => DeployModalData, |_s, db| {
         modal_loaders::load_deploy_data(db)
             .unwrap_or_default()
+    }
+}
+
+impl_domain_query! {
+    GetDeployReadyFiles => Vec<crate::meta::views::DeploySignalFile>, |_s, db| {
+        db.get_deploy_ready_files().unwrap_or_default()
     }
 }
 
@@ -1167,7 +1186,7 @@ dispatch_domain_query_impl! {
     GetDeployStatus,
     GetExternalMatches,
     GetPackingDirs,
-    GetOobFiles,
+    GetOobSummary,
     GetMovedFiles,
     GetMissingAlbumSingleSignals,
     GetPackingKnots,
@@ -1182,6 +1201,7 @@ dispatch_domain_query_impl! {
     GetReleaseOverlapData,
     GetLosslessRemuxData,
     GetDeployData,
+    GetDeployReadyFiles,
     GetManualReviewData,
     GetCorpusTags,
     GetPackingBrowserData,
@@ -1285,17 +1305,28 @@ mod tests {
     // -- Detail queries: empty DB returns empty vecs --
 
     #[test]
-    fn get_oob_files_empty_db() {
+    fn get_oob_summary_empty_db() {
+        use mm_meta::views::ConflictBucket;
+
         let db = test_db();
         let read_db = ReadOnlyDb::new(&db);
-        // All files
-        let result = GetOobFiles { bucket: None }.execute(&read_db);
-        assert!(result.is_empty());
+
+        // Cold open: every bucket empty, nothing paged, nothing truncated.
+        let result = GetOobSummary::first_page().execute(&read_db);
+        assert_eq!(result.counts, [0; 4]);
+        assert!(result.files.is_empty());
+        assert_eq!(result.total(), 0);
+        assert!(!result.is_truncated());
+
         // Per bucket
-        use mm_meta::views::ConflictBucket;
         for bucket in ConflictBucket::ALL {
-            let result = GetOobFiles { bucket: Some(bucket) }.execute(&read_db);
-            assert!(result.is_empty(), "expected empty for bucket {:?}", bucket);
+            let result = GetOobSummary::bucket(bucket).execute(&read_db);
+            assert_eq!(result.bucket, bucket);
+            assert!(
+                result.files.is_empty(),
+                "expected empty for bucket {:?}",
+                bucket
+            );
         }
     }
 
@@ -1304,7 +1335,8 @@ mod tests {
         let db = test_db();
         let read_db = ReadOnlyDb::new(&db);
         let result = GetMovedFiles.execute(&read_db);
-        assert!(result.is_empty());
+        assert_eq!(result.total, 0);
+        assert!(result.sample.is_empty());
     }
 
     #[test]
@@ -1510,8 +1542,8 @@ mod tests {
         t!(serde_json::to_string(&GetPackingDirs.execute(&read_db)));
 
         // Detail queries
-        t!(serde_json::to_string(&GetOobFiles { bucket: None }.execute(&read_db)));
-        t!(serde_json::to_string(&GetOobFiles { bucket: Some(mm_meta::views::ConflictBucket::MtimeOnly) }.execute(&read_db)));
+        t!(serde_json::to_string(&GetOobSummary::first_page().execute(&read_db)));
+        t!(serde_json::to_string(&GetOobSummary::bucket(mm_meta::views::ConflictBucket::MtimeOnly).execute(&read_db)));
         t!(serde_json::to_string(&GetMovedFiles.execute(&read_db)));
         t!(serde_json::to_string(&GetMissingAlbumSingleSignals.execute(&read_db)));
         t!(serde_json::to_string(&GetPackingKnots.execute(&read_db)));

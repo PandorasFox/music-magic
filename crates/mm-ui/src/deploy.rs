@@ -8,6 +8,7 @@ use mm_meta::decisions::DecisionKey;
 use mm_meta::mutations::Mutation;
 use mm_meta::paths::PathResolver;
 use mm_meta::views::cluster_deploy::DeployModalData;
+use mm_meta::views::DeploySignalFile;
 
 use crate::decision_keys;
 
@@ -30,11 +31,15 @@ pub struct PreparedDeploy {
 /// Both TUI and web call this identically; client code then stages the
 /// returned decisions using platform-specific mechanisms (gesture exchange
 /// in TUI, transaction API in web).
+///
+/// `new_files` is the per-file deploy-ready list, fetched separately via
+/// `GetDeployReadyFiles` — the modal payload carries only counts.
 pub fn prepare_deploy_decisions(
     data: &DeployModalData,
+    new_files: &[DeploySignalFile],
     resolver: &PathResolver,
 ) -> PreparedDeploy {
-    let mutation_set = data.to_mutations(resolver);
+    let mutation_set = data.to_mutations(new_files, resolver);
 
     let mut decisions = Vec::new();
 

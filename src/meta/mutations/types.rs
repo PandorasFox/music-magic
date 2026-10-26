@@ -121,6 +121,8 @@ impl MutationDispatch for Mutation {
             Mutation::HardLink(m) => m,
             Mutation::LibraryMove(m) => m,
             Mutation::UpdateFilePath(m) => m,
+            Mutation::AcknowledgeMovedFiles(m) => m,
+            Mutation::ResolveOobBucket(m) => m,
             Mutation::DropFromIndex(m) => m,
             Mutation::DropDirectoryFromIndex(m) => m,
             Mutation::AcknowledgeMtimeOnly(m) => m,

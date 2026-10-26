@@ -94,10 +94,32 @@ pub struct GetPackingDirs;
 // Detail Queries (Wave 1: simple return types, no inode resolution)
 // ============================================================================
 
-/// OOB files classified into conflict buckets, optionally filtered by bucket.
+/// OOB bucket totals plus one bounded page of a single bucket.
+///
+/// `bucket` selects which bucket to page; `None` means "the first non-empty
+/// one", which is what opening the modal cold asks for. `limit` bounds the
+/// page — the totals always cover every bucket regardless.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetOobFiles {
+pub struct GetOobSummary {
     pub bucket: Option<crate::views::ConflictBucket>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl GetOobSummary {
+    /// Rows per page. Large enough that scrolling rarely reaches the end,
+    /// small enough that a page stays a few hundred KB on the wire.
+    pub const PAGE: usize = 1000;
+
+    /// First page of whichever bucket is non-empty.
+    pub fn first_page() -> Self {
+        Self { bucket: None, offset: 0, limit: Self::PAGE }
+    }
+
+    /// First page of a named bucket.
+    pub fn bucket(bucket: crate::views::ConflictBucket) -> Self {
+        Self { bucket: Some(bucket), offset: 0, limit: Self::PAGE }
+    }
 }
 
 /// Files with moved-file signals (same inode, different path).
@@ -165,6 +187,13 @@ pub struct GetLosslessRemuxData;
 /// Deploy modal data — library_name is baked into the deploy-ready signals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetDeployData;
+
+/// Full per-file deploy-ready list, for building deploy mutations at confirm
+/// time. Deliberately separate from `GetDeployData`, which carries only
+/// counts: this response is ~500k rows on a real corpus and is fetched only
+/// when the operator actually commits to a deploy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetDeployReadyFiles;
 
 /// Manual review data for a specific review kind.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,8 +502,8 @@ domain_query_protocol! {
     GetPackingDirs("packing-dirs") => crate::domain_query_types::PackingDirsData,
 
     // Detail queries (Wave 1)
-    GetOobFiles("oob-files") => Vec<crate::views::OobFile>,
-    GetMovedFiles("moved-files") => Vec<crate::views::MovedFileInfo>,
+    GetOobSummary("oob-summary") => crate::views::OobSummary,
+    GetMovedFiles("moved-files") => crate::views::MovedFileSummary,
     GetMissingAlbumSingleSignals("missing-album-single-signals") => Vec<MissingAlbumSingleSignalWire>,
     GetPackingKnots("packing-knots") => Vec<crate::signals::data::PackingKnotData>,
     GetPackingInodePaths("packing-inode-paths") => Vec<(i64, String)>,
@@ -492,6 +521,7 @@ domain_query_protocol! {
     GetReleaseOverlapData("release-overlap-data") => crate::views::cluster_deploy::DirectoryClusterModalData,
     GetLosslessRemuxData("lossless-remux-data") => crate::views::cluster_deploy::LosslessRemuxModalData,
     GetDeployData("deploy-data") => crate::views::cluster_deploy::DeployModalData,
+    GetDeployReadyFiles("deploy-ready-files") => Vec<crate::views::DeploySignalFile>,
     GetManualReviewData("manual-review-data") => crate::views::review_match::ManualReviewData,
     GetCorpusTags("corpus-tags") => Vec<(String, String)>,
     GetPackingBrowserData("packing-browser-data") => crate::domain_query_types::PackingBrowserData,

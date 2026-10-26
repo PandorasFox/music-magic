@@ -213,6 +213,9 @@ impl TransactionReviewState {
 /// Count unique files affected by a set of mutations.
 fn count_unique_files(mutations: &[Mutation]) -> usize {
     let mut inodes = std::collections::HashSet::new();
+    // Bulk mutations carry no inode list — the worker resolves the affected
+    // rows itself — so their file count is tracked separately.
+    let mut bulk_files = 0usize;
 
     for m in mutations {
         match m {
@@ -248,6 +251,16 @@ fn count_unique_files(mutations: &[Mutation]) -> usize {
                 inodes.extend(m.tracks.iter().map(|(id, _)| *id));
             }
 
+            // Bulk: affects the whole outstanding relocation set.
+            Mutation::AcknowledgeMovedFiles(ref m) => {
+                bulk_files += m.observed_count;
+            }
+
+            // Bulk: affects the whole outstanding OOB bucket.
+            Mutation::ResolveOobBucket(ref m) => {
+                bulk_files += m.observed_count;
+            }
+
             // Mutations without inodes
             Mutation::StashFromZone(_)
             | Mutation::StashLeftovers(_)
@@ -269,7 +282,7 @@ fn count_unique_files(mutations: &[Mutation]) -> usize {
         }
     }
 
-    inodes.len()
+    inodes.len() + bulk_files
 }
 
 /// Fetch decision summaries from the active transaction via the App.

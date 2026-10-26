@@ -20,6 +20,7 @@ use super::indexing::{
     DropDirectoryFromIndexMutation, DropExternalMatchMutation, DropFromIndexMutation,
     EmitCanonicalTagMutation, EmitExpectedDuplicateMutation, EmitExpectedMissingTagMutation,
     EmitExpectedOverlapMutation, FlushTagsToDiskMutation, IndexFileFromPathMutation,
+    AcknowledgeMovedFilesMutation, ResolveOobBucketMutation,
     UpdateFilePathMutation,
 };
 use super::tag_edit::ApplyTagOpsMutation;
@@ -302,6 +303,10 @@ pub enum Mutation {
     LibraryMove(LibraryMoveMutation),
     /// Update file path in files table.
     UpdateFilePath(UpdateFilePathMutation),
+    /// Acknowledge all outstanding same-zone relocations in bulk.
+    AcknowledgeMovedFiles(AcknowledgeMovedFilesMutation),
+    /// Resolve every outstanding OOB signal in one bucket, in bulk.
+    ResolveOobBucket(ResolveOobBucketMutation),
     /// Drop file from index.
     DropFromIndex(DropFromIndexMutation),
     /// Drop a directory and all its contents from the index.
@@ -352,6 +357,8 @@ pub enum MutationKind {
     HardLink,
     LibraryMove,
     UpdateFilePath,
+    AcknowledgeMovedFiles,
+    ResolveOobBucket,
     DropFromIndex,
     DropDirectoryFromIndex,
     AcknowledgeMtimeOnly,
@@ -382,6 +389,8 @@ impl Mutation {
             Mutation::HardLink(_) => MutationKind::HardLink,
             Mutation::LibraryMove(_) => MutationKind::LibraryMove,
             Mutation::UpdateFilePath(_) => MutationKind::UpdateFilePath,
+            Mutation::AcknowledgeMovedFiles(_) => MutationKind::AcknowledgeMovedFiles,
+            Mutation::ResolveOobBucket(_) => MutationKind::ResolveOobBucket,
             Mutation::DropFromIndex(_) => MutationKind::DropFromIndex,
             Mutation::DropDirectoryFromIndex(_) => MutationKind::DropDirectoryFromIndex,
             Mutation::AcknowledgeMtimeOnly(_) => MutationKind::AcknowledgeMtimeOnly,
@@ -412,6 +421,8 @@ impl Mutation {
             Mutation::HardLink(_) => "Hard link",
             Mutation::LibraryMove(_) => "Library move",
             Mutation::UpdateFilePath(_) => "Update path",
+            Mutation::AcknowledgeMovedFiles(_) => "Acknowledge relocations",
+            Mutation::ResolveOobBucket(_) => "Resolve OOB bucket",
             Mutation::DropFromIndex(_) => "Drop from index",
             Mutation::DropDirectoryFromIndex(_) => "Drop directory",
             Mutation::AcknowledgeMtimeOnly(_) => "Acknowledge mtime",
@@ -445,6 +456,8 @@ impl Mutation {
             Mutation::HardLink(m) => m.diff_entries(),
             Mutation::LibraryMove(m) => m.diff_entries(),
             Mutation::UpdateFilePath(m) => m.diff_entries(),
+            Mutation::AcknowledgeMovedFiles(m) => m.diff_entries(),
+            Mutation::ResolveOobBucket(m) => m.diff_entries(),
             Mutation::DropFromIndex(m) => m.diff_entries(),
             Mutation::DropDirectoryFromIndex(m) => m.diff_entries(),
             Mutation::AcknowledgeMtimeOnly(m) => m.diff_entries(),

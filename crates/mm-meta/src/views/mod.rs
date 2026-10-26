@@ -476,6 +476,36 @@ pub struct OobFile {
     pub mismatches: Vec<TagMismatchEntry>,
 }
 
+/// Per-bucket totals plus one bounded page of a single bucket.
+///
+/// The OOB tables reach hundreds of thousands of rows during a bulk tag
+/// rewrite, so the full set is never shipped: the modal renders tab counts,
+/// one scrolled window, and the cursor file's mismatches. `total()` is the
+/// truth for the active bucket; `files` is only what fits the window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OobSummary {
+    /// Totals for every bucket, indexed by [`ConflictBucket::index`].
+    pub counts: [usize; 4],
+    /// The bucket `files` was drawn from.
+    pub bucket: ConflictBucket,
+    /// Index of the first entry of `files` within the bucket.
+    pub offset: usize,
+    /// The page itself, ordered by path.
+    pub files: Vec<OobFile>,
+}
+
+impl OobSummary {
+    /// Total rows in the active bucket, of which `files` is a window.
+    pub fn total(&self) -> usize {
+        self.counts[self.bucket.index()]
+    }
+
+    /// Whether the active bucket holds more rows than this page shows.
+    pub fn is_truncated(&self) -> bool {
+        self.offset + self.files.len() < self.total()
+    }
+}
+
 /// Deploy status for the Deploy view and titlebar indicator.
 /// Computed at cache refresh time, never in render.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -498,21 +528,26 @@ pub struct MovedFileInfo {
     pub new_zone: String,
 }
 
-impl MovedFileInfo {
-    /// Build an UpdateFilePath mutation to acknowledge this move.
-    pub fn to_update_mutation(&self) -> crate::mutations::Mutation {
-        let cross_zone = if self.old_zone != self.new_zone {
-            Some(self.new_zone.clone())
-        } else {
-            None
-        };
-        crate::mutations::Mutation::UpdateFilePath(
-            crate::mutations::indexing::UpdateFilePathMutation {
-                zone: self.old_zone.clone(),
-                inode: self.inode,
-                new_path: std::path::PathBuf::from(&self.new_path),
-                new_zone: cross_zone,
-            },
-        )
+/// Summary of outstanding MovedFile signals.
+///
+/// Relocations are acknowledged wholesale, never individually, so the payload
+/// carries a count plus a bounded sample for display rather than every row.
+/// A corpus reorganization can produce hundreds of thousands of these, and
+/// shipping them made the view unopenable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MovedFileSummary {
+    /// Total outstanding MovedFile signals.
+    pub total: usize,
+    /// First `SAMPLE_LIMIT` moves, for display only.
+    pub sample: Vec<MovedFileInfo>,
+}
+
+impl MovedFileSummary {
+    /// How many rows the sample carries.
+    pub const SAMPLE_LIMIT: usize = 200;
+
+    /// Whether `sample` is a truncated view of `total`.
+    pub fn is_truncated(&self) -> bool {
+        self.total > self.sample.len()
     }
 }

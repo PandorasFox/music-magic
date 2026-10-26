@@ -5,7 +5,7 @@
 //! and resolved through a single tabbed interface.
 //!
 //! Route: `/resolve/oob-resolution`
-//! Query: `GetOobFiles`
+//! Query: `GetOobSummary` (bucket totals + one bounded page)
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use ratatui::style::{Color, Style};
 
 use mm_meta::decisions::DecisionKey;
-use mm_meta::views::{ConflictBucket, OobFile, TagMismatchEntry};
+use mm_meta::views::{ConflictBucket, OobFile, OobSummary, TagMismatchEntry};
 
 use crate::geometry::FocusPane;
 use crate::input::InputAction;
@@ -153,6 +153,9 @@ impl ModalButtons for OobButton {
 pub enum OobAction {
     None,
     Navigate,
+    /// The active tab changed — the held page belongs to the previous bucket
+    /// and the caller must re-query before rendering.
+    BucketChanged,
     ApplyDb,
     AssimilateDisk,
     Acknowledge,
@@ -169,17 +172,20 @@ pub struct OobBucketState {
 }
 
 impl OobBucketState {
+    /// Build a page's list state with nothing selected.
+    ///
+    /// An empty selection means "the whole bucket", which is both the default
+    /// action and the only one that scales — `files` is a bounded window, so
+    /// pre-selecting it would silently mean "the first thousand" on a bucket
+    /// holding half a million rows.
     pub fn new(files: Vec<OobFile>) -> Self {
-        let file_count = files.len();
-        let mut list = StandardListState::new(StandardListConfig {
-            multi_select: true,
-            ..Default::default()
-        });
-        for i in 0..file_count {
-            list.selected.insert(i);
+        Self {
+            files,
+            list: StandardListState::new(StandardListConfig {
+                multi_select: true,
+                ..Default::default()
+            }),
         }
-
-        Self { files, list }
     }
 
     pub fn current_file(&self) -> Option<&OobFile> {
@@ -221,55 +227,50 @@ impl OobBucketState {
 // OOB Resolution State
 // ============================================================================
 
+/// One bucket's totals plus a window into the active one.
+///
+/// Only the active bucket's page is held. The other three contribute their
+/// counts and nothing else — switching tabs re-queries, because holding every
+/// bucket's rows is exactly what made this modal unopenable during a bulk tag
+/// rewrite.
 pub struct OobResolutionState {
     pub active_bucket: ConflictBucket,
-    pub buckets: [OobBucketState; 4],
+    /// Totals for every bucket, indexed by [`ConflictBucket::index`].
     pub bucket_counts: [usize; 4],
+    /// Window into the active bucket, ordered by path.
+    page: OobBucketState,
+    /// Index of the window's first entry within the active bucket.
+    page_offset: usize,
     pub frame: FrameState<OobButton>,
 }
 
 impl OobResolutionState {
-    pub fn new(files: Vec<OobFile>) -> Self {
-        let mut b0 = Vec::new();
-        let mut b1 = Vec::new();
-        let mut b2 = Vec::new();
-        let mut b3 = Vec::new();
-
-        for file in files {
-            match file.bucket {
-                ConflictBucket::MtimeOnly => b0.push(file),
-                ConflictBucket::DbOnly => b1.push(file),
-                ConflictBucket::DiskOnly => b2.push(file),
-                ConflictBucket::Conflict => b3.push(file),
-            }
-        }
-
-        let bucket_counts = [b0.len(), b1.len(), b2.len(), b3.len()];
-
-        let initial_bucket = ConflictBucket::ALL
-            .iter()
-            .find(|b| bucket_counts[b.index()] > 0)
-            .copied()
-            .unwrap_or(ConflictBucket::MtimeOnly);
-
-        let buckets = [
-            OobBucketState::new(b0),
-            OobBucketState::new(b1),
-            OobBucketState::new(b2),
-            OobBucketState::new(b3),
-        ];
-
+    pub fn new(summary: OobSummary) -> Self {
         let mut frame = FrameState::new();
-        if initial_bucket.is_acknowledgeable() {
+        if summary.bucket.is_acknowledgeable() {
             frame.buttons.selected = OobButton::Acknowledge;
         }
 
         Self {
-            active_bucket: initial_bucket,
-            buckets,
-            bucket_counts,
+            active_bucket: summary.bucket,
+            bucket_counts: summary.counts,
+            page_offset: summary.offset,
+            page: OobBucketState::new(summary.files),
             frame,
         }
+    }
+
+    /// Swap in a freshly queried page after a bucket switch.
+    ///
+    /// Cursor and selection reset with the page: both index into the window,
+    /// and the window has been replaced.
+    pub fn set_page(&mut self, summary: OobSummary) {
+        self.active_bucket = summary.bucket;
+        self.bucket_counts = summary.counts;
+        self.page_offset = summary.offset;
+        self.page = OobBucketState::new(summary.files);
+        let ctx = self.button_ctx();
+        self.frame.buttons.clamp(&ctx);
     }
 
     pub fn selected_path(&self) -> Option<&str> {
@@ -279,22 +280,39 @@ impl OobResolutionState {
     }
 
     pub fn active_bucket_state(&self) -> &OobBucketState {
-        &self.buckets[self.active_bucket.index()]
+        &self.page
     }
 
     pub fn active_bucket_state_mut(&mut self) -> &mut OobBucketState {
-        &mut self.buckets[self.active_bucket.index()]
+        &mut self.page
+    }
+
+    /// Rows in the active bucket — the count, not the page size.
+    pub fn active_bucket_total(&self) -> usize {
+        self.bucket_counts[self.active_bucket.index()]
+    }
+
+    /// Whether the active bucket holds more rows than the page shows.
+    pub fn is_truncated(&self) -> bool {
+        self.page_offset + self.page.files.len() < self.active_bucket_total()
     }
 
     pub fn total_files(&self) -> usize {
         self.bucket_counts.iter().sum()
     }
 
+    /// Whether the operator has narrowed the action to specific visible rows.
+    ///
+    /// No selection means the whole bucket, matching the button labels.
+    pub fn has_explicit_selection(&self) -> bool {
+        !self.page.list.selected.is_empty()
+    }
+
     pub fn button_ctx(&self) -> OobButtonCtx {
         OobButtonCtx {
             is_resolvable: self.active_bucket.is_resolvable(),
             is_acknowledgeable: self.active_bucket.is_acknowledgeable(),
-            has_files: !self.active_bucket_state().files.is_empty(),
+            has_files: self.active_bucket_total() > 0,
         }
     }
 
@@ -345,13 +363,13 @@ impl OobResolutionState {
                 self.active_bucket = self.active_bucket.next();
                 let ctx = self.button_ctx();
                 self.frame.buttons.clamp(&ctx);
-                return OobAction::Navigate;
+                return OobAction::BucketChanged;
             }
             InputAction::CyclePrev => {
                 self.active_bucket = self.active_bucket.prev();
                 let ctx = self.button_ctx();
                 self.frame.buttons.clamp(&ctx);
-                return OobAction::Navigate;
+                return OobAction::BucketChanged;
             }
             InputAction::NavUp => {
                 return if self.active_bucket_state_mut().navigate_up() {
@@ -403,97 +421,97 @@ impl super::dispatch::Dispatchable for OobResolutionState {
         use mm_meta::mutations::Mutation;
         use super::dispatch::DispatchResult;
 
-        match action {
-            OobAction::None | OobAction::Navigate => DispatchResult::Handled,
-            OobAction::ApplyDb | OobAction::AssimilateDisk => {
-                let bucket_state = self.active_bucket_state();
-                let indices: Vec<usize> = if !bucket_state.list.selected.is_empty() {
-                    bucket_state.list.selected.iter().copied().collect()
-                } else {
-                    (0..bucket_state.files.len()).collect()
-                };
+        use mm_meta::mutations::indexing::{OobBucketAction, ResolveOobBucketMutation};
 
-                let tracks: Vec<(i64, std::path::PathBuf)> = indices
-                    .iter()
-                    .filter_map(|&idx| bucket_state.files.get(idx))
-                    .map(|f| (f.inode, resolver.resolve_for_zone(Zone::Corpus, std::path::Path::new(&f.path))))
-                    .collect();
-
-                if tracks.is_empty() {
-                    return DispatchResult::Handled;
-                }
-
-                let (label, mutations): (&str, Vec<Mutation>) = if action == OobAction::ApplyDb {
-                    (
-                        "Apply DB tags \u{2192} files",
-                        tracks
-                            .into_iter()
-                            .map(|(inode, path)| {
-                                Mutation::ApplyDbTagsToDisk(ApplyDbTagsToDiskMutation {
-                                    inode,
-                                    path,
-                                    zone: Zone::Corpus,
-                                })
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (
-                        "Assimilate file tags \u{2192} DB",
-                        tracks
-                            .into_iter()
-                            .map(|(inode, path)| {
-                                Mutation::AssimilateDiskTagsToDb(AssimilateDiskTagsToDbMutation {
-                                    inode,
-                                    path,
-                                    zone: None,
-                                })
-                            })
-                            .collect(),
-                    )
-                };
-
-                let key = DecisionKey::OobResolution {
-                    bucket: self.active_bucket,
-                };
-
-                DispatchResult::Stage {
-                    key,
-                    label: label.into(),
-                    mutations,
-                }
+        // The bucket action for each button, and the bucket it acts on.
+        let bucket_action = match action {
+            OobAction::None | OobAction::Navigate | OobAction::BucketChanged => {
+                return DispatchResult::Handled
             }
-            OobAction::Acknowledge => {
-                let bucket_state = self.active_bucket_state();
-                let indices: Vec<usize> = if !bucket_state.list.selected.is_empty() {
-                    bucket_state.list.selected.iter().copied().collect()
-                } else {
-                    (0..bucket_state.files.len()).collect()
-                };
+            OobAction::Cancel => return DispatchResult::Cancel,
+            OobAction::ApplyDb => OobBucketAction::ApplyDbToDisk,
+            OobAction::AssimilateDisk => OobBucketAction::AssimilateDiskToDb,
+            OobAction::Acknowledge => OobBucketAction::AcknowledgeMtime,
+        };
+        let bucket = match action {
+            OobAction::Acknowledge => ConflictBucket::MtimeOnly,
+            _ => self.active_bucket,
+        };
+        let key = DecisionKey::OobResolution { bucket };
 
-                let tracks: Vec<(i64, std::path::PathBuf)> = indices
-                    .iter()
-                    .filter_map(|&idx| bucket_state.files.get(idx))
-                    .map(|f| (f.inode, resolver.resolve_for_zone(Zone::Corpus, std::path::Path::new(&f.path))))
-                    .collect();
+        // No selection means the whole bucket, which is staged as a single
+        // mutation naming the bucket. Enumerating it here would put a mutation
+        // per file into the decision — half a million of them during a bulk tag
+        // rewrite — and the modal only ever holds a window of the bucket
+        // anyway, so the enumeration would silently act on the window alone.
+        if !self.has_explicit_selection() {
+            let observed_count = self.bucket_counts[bucket.index()];
+            if observed_count == 0 {
+                return DispatchResult::Handled;
+            }
+            return DispatchResult::Stage {
+                key,
+                label: bucket_action.label().into(),
+                mutations: vec![Mutation::ResolveOobBucket(ResolveOobBucketMutation {
+                    bucket,
+                    action: bucket_action,
+                    observed_count,
+                })],
+            };
+        }
 
-                if tracks.is_empty() {
-                    return DispatchResult::Handled;
-                }
+        // An explicit selection is per-file by construction: it can only name
+        // rows the operator can see, so it is bounded by the page.
+        let page = self.active_bucket_state();
+        let tracks: Vec<(i64, std::path::PathBuf)> = page
+            .list
+            .selected
+            .iter()
+            .filter_map(|&idx| page.files.get(idx))
+            .map(|f| {
+                (
+                    f.inode,
+                    resolver.resolve_for_zone(Zone::Corpus, std::path::Path::new(&f.path)),
+                )
+            })
+            .collect();
 
-                let mutations = vec![Mutation::AcknowledgeMtimeOnly(
+        if tracks.is_empty() {
+            return DispatchResult::Handled;
+        }
+
+        let mutations: Vec<Mutation> = match bucket_action {
+            OobBucketAction::ApplyDbToDisk => tracks
+                .into_iter()
+                .map(|(inode, path)| {
+                    Mutation::ApplyDbTagsToDisk(ApplyDbTagsToDiskMutation {
+                        inode,
+                        path,
+                        zone: Zone::Corpus,
+                    })
+                })
+                .collect(),
+            OobBucketAction::AssimilateDiskToDb => tracks
+                .into_iter()
+                .map(|(inode, path)| {
+                    Mutation::AssimilateDiskTagsToDb(AssimilateDiskTagsToDbMutation {
+                        inode,
+                        path,
+                        zone: None,
+                    })
+                })
+                .collect(),
+            OobBucketAction::AcknowledgeMtime => {
+                vec![Mutation::AcknowledgeMtimeOnly(
                     AcknowledgeMtimeOnlyMutation { tracks },
-                )];
-
-                DispatchResult::Stage {
-                    key: DecisionKey::OobResolution {
-                        bucket: ConflictBucket::MtimeOnly,
-                    },
-                    label: "Acknowledge mtime changes".into(),
-                    mutations,
-                }
+                )]
             }
-            OobAction::Cancel => DispatchResult::Cancel,
+        };
+
+        DispatchResult::Stage {
+            key,
+            label: bucket_action.label().into(),
+            mutations,
         }
     }
 

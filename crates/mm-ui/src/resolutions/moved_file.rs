@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use ratatui::style::Color;
 
 use mm_meta::decisions::DecisionKey;
-use mm_meta::views::MovedFileInfo;
+use mm_meta::views::MovedFileSummary;
 
 use crate::modal_buttons::ModalButtons;
 use crate::modal_frame::ContentLayout;
@@ -21,26 +21,29 @@ use crate::resolution_state::{ResolutionData, ResolutionState};
 // Data wrapper
 // ============================================================================
 
-/// Wraps a `Vec<MovedFileInfo>` to implement `ResolutionData`.
+/// Wraps a `MovedFileSummary` to implement `ResolutionData`.
+///
+/// Only the bounded sample is listable; acknowledgement always applies to the
+/// full outstanding set, not to what is on screen.
 pub struct MovedFileData {
-    pub files: Vec<MovedFileInfo>,
+    pub summary: MovedFileSummary,
 }
 
 impl ResolutionData for MovedFileData {
     type ButtonCtx = MovedFileButtonCtx;
 
     fn list_len(&self) -> usize {
-        self.files.len()
+        self.summary.sample.len()
     }
 
     fn button_ctx(&self) -> MovedFileButtonCtx {
         MovedFileButtonCtx {
-            has_files: !self.files.is_empty(),
+            has_files: self.summary.total > 0,
         }
     }
 
     fn selected_path(&self, cursor: usize) -> Option<&str> {
-        self.files.get(cursor).map(|f| f.new_path.as_str())
+        self.summary.sample.get(cursor).map(|f| f.new_path.as_str())
     }
 
     fn content_layout(&self) -> ContentLayout {
@@ -110,15 +113,22 @@ impl super::dispatch::Dispatchable for MovedFileState {
 
         match action {
             MovedFileAction::Acknowledge => {
-                if self.data.files.is_empty() {
+                let total = self.data.summary.total;
+                if total == 0 {
                     return DispatchResult::Handled;
                 }
 
-                let mutations: Vec<_> = self.data.files.iter().map(|f| f.to_update_mutation()).collect();
+                // One bulk mutation, not one per file: the worker applies the
+                // whole signal_moved_file table in a single statement.
+                let mutations = vec![mm_meta::mutations::Mutation::AcknowledgeMovedFiles(
+                    mm_meta::mutations::indexing::AcknowledgeMovedFilesMutation {
+                        observed_count: total,
+                    },
+                )];
                 let label = format!(
                     "Acknowledge {} moved file{}",
-                    mutations.len(),
-                    if mutations.len() == 1 { "" } else { "s" }
+                    total,
+                    if total == 1 { "" } else { "s" }
                 );
 
                 let ctx = self.data.button_ctx();

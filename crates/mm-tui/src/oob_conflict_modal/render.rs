@@ -117,14 +117,26 @@ fn render_file_list(f: &mut Frame, area: Rect, state: &OobResolutionState) {
 
     let bucket_state = state.active_bucket_state();
 
+    // The list is a window onto the bucket, so it names both numbers rather
+    // than letting the page size read as the total. With no selection the
+    // buttons act on the whole bucket, including the rows not shown.
+    let total = state.active_bucket_total();
     let title = if !bucket_state.list.selected.is_empty() {
         format!(
-            "Files ({}, {} selected)",
+            "Files ({} selected of {} shown, {} total)",
+            bucket_state.list.selected.len(),
             bucket_state.files.len(),
-            bucket_state.list.selected.len()
+            total,
+        )
+    } else if state.is_truncated() {
+        format!(
+            "Files (showing {} of {} — actions apply to all {})",
+            bucket_state.files.len(),
+            total,
+            total,
         )
     } else {
-        format!("Files ({})", bucket_state.files.len())
+        format!("Files ({})", total)
     };
 
     let block = crate::helpers::focused_block(&title, is_focused);

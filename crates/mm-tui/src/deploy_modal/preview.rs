@@ -64,8 +64,8 @@ fn render_title(data: &DeployModalData, f: &mut Frame, area: Rect) {
 
     // Build summary line
     let mut summary_parts: Vec<String> = Vec::new();
-    if !data.new.is_empty() {
-        summary_parts.push(format!("{} new", data.new.len()));
+    if data.new_count > 0 {
+        summary_parts.push(format!("{} new", data.new_count));
     }
     if !data.sidecars.is_empty() {
         summary_parts.push(format!("{} covers", data.sidecars.len()));
@@ -173,11 +173,20 @@ fn render_tabbed_list(
     // Get display items for current tab
     // For New and Leftover, show "directory (count)" format
     let items: Vec<Cow<'_, str>> = match active_tab {
-        DeployTab::Healthy => cached_data
-            .healthy
-            .iter()
-            .map(|f| Cow::Borrowed(f.corpus_path.as_str()))
-            .collect(),
+        DeployTab::Healthy => {
+            // Healthy is a summary: one row per library, no scrolling.
+            cached_data
+                .healthy_by_library
+                .iter()
+                .map(|(name, count)| {
+                    Cow::Owned(format!(
+                        "{}: {} deployed",
+                        name,
+                        format_thousands(*count),
+                    ))
+                })
+                .collect()
+        }
         DeployTab::New => cached_data
             .new_by_dir
             .iter()
@@ -243,15 +252,10 @@ fn render_info_pane(
     let mut owned_deploy_path = String::new();
 
     let info = match active_tab {
-        DeployTab::Healthy => {
-            cached_data
-                .healthy
-                .get(scroll)
-                .map(|file| SignalInfo::Healthy {
-                    corpus_path: &file.corpus_path,
-                    library_path: &file.deploy_path,
-                })
-        }
+        DeployTab::Healthy => Some(SignalInfo::HealthySummary {
+            totals: cached_data.healthy_by_library.as_slice(),
+            total: cached_data.healthy_count,
+        }),
         DeployTab::New => {
             cached_data.new_by_dir.get(scroll).map(|dir| {
                 // Find sidecars matching this directory
@@ -330,6 +334,18 @@ fn render_info_pane(
     let info = info.unwrap_or(SignalInfo::None);
     let pane = SignalInfoPane::new(active_tab, &info);
     pane.render(f, area);
+}
+
+fn format_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
 }
 
 fn render_controls(f: &mut Frame, area: Rect) {

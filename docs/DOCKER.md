@@ -253,7 +253,7 @@ The main data access endpoint is `GET /queries/{name}` (simple) or `POST /querie
 
 | Route | Returns |
 |-------|---------|
-| `oob-files` | Out-of-band tag change details |
+| `oob-summary` | Out-of-band tag bucket totals + one bounded page (`?bucket=`, `?offset=`, `?limit=`) |
 | `moved-files` | Relocated file details |
 | `corrupt-file-data` | Corrupt file info |
 | `subpar-duplicate-data` | Duplicate analysis details |

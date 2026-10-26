@@ -456,8 +456,6 @@ pub fn load_deploy_data(
         DeployModalData,
     };
 
-    let mut healthy = read_db.get_deployed_healthy_files()?;
-    let new = read_db.get_deploy_ready_files()?;
     let conflicts = read_db.get_deploy_conflict_groups()?;
     let mut leftover = read_db.get_library_leftover_files()?;
     let stale = read_db.get_library_stale_files()?;
@@ -470,26 +468,10 @@ pub fn load_deploy_data(
     // winner changed — the old winner is still Healthy but a different corpus
     // file now owns that path. Move superseded files from healthy to leftover
     // so the pipeline stashes them before deploying the new winner.
-    let new_destinations: HashSet<String> = new
-        .iter()
-        .filter(|f| !f.library_name.is_empty())
-        .map(|f| format!("{}/{}", f.library_name, f.deploy_path))
-        .collect();
-
-    let mut superseded = Vec::new();
-    healthy.retain(|h| {
-        // For healthy files, deploy_path is the full library path (e.g. "music/Artist/Album/track.flac")
-        if new_destinations.contains(&h.deploy_path) {
-            superseded.push(mm_meta::views::LeftoverSignalFile {
-                library_name: h.library_name.clone(),
-                library_path: h.deploy_path.clone(),
-            });
-            false
-        } else {
-            true
-        }
-    });
-
+    //
+    // Done as a single join inside SQLite. Materializing every deploy-ready
+    // destination and probing them in chunks cost ~30s at 500k pending files.
+    let superseded = read_db.get_superseded_healthy()?;
     if !superseded.is_empty() {
         crate::logging::log_general(format!(
             "[UI] DeployModalData::load: {} superseded deployments moved from healthy to leftover",
@@ -498,34 +480,49 @@ pub fn load_deploy_data(
         leftover.extend(superseded);
     }
 
+    let healthy_by_library = read_db.get_deployed_healthy_counts()?;
+    let healthy_count: usize = healthy_by_library.iter().map(|(_, c)| *c).sum();
+
+    // New files are summarized, never enumerated: the New tab renders and
+    // selects at directory granularity, so the per-file list would be a
+    // ~500k-row payload nothing reads. Staging re-fetches it on confirm.
+    let new_by_library = read_db.get_deploy_ready_counts_by_library()?;
+    let new_count: usize = new_by_library.iter().map(|(_, c)| *c).sum();
+
     crate::logging::log_general(format!(
         "[UI] DeployModalData::load: healthy={}, new={}, conflicts={}, leftover={}, stale={}, sidecars={}, sidecar_conflicts={}",
-        healthy.len(), new.len(), conflicts.len(), leftover.len(), stale.len(), sidecars.len(), sidecar_conflicts.len(),
+        healthy_count, new_count, conflicts.len(), leftover.len(), stale.len(), sidecars.len(), sidecar_conflicts.len(),
     ));
 
-    let mut new_by_dir = aggregate_by_directory(new.iter().map(|f| f.corpus_path.as_str()));
+    let mut new_by_dir = to_directory_aggregates(read_db.get_deploy_ready_counts_by_directory()?);
     merge_sidecar_counts(&mut new_by_dir, &sidecars);
 
     let leftover_by_dir =
         aggregate_by_directory(leftover.iter().map(|f| f.library_path.as_str()));
 
+    // Leftovers are a small list, so probe them against deploy-ready
+    // destinations rather than the other way around.
+    let leftover_paths: Vec<String> = leftover.iter().map(|f| f.library_path.clone()).collect();
+    let replaced_destinations = read_db.filter_paths_targeted_by_deploy_ready(&leftover_paths)?;
     let replaced_count = leftover
         .iter()
-        .filter(|f| new_destinations.contains(&f.library_path))
+        .filter(|f| replaced_destinations.contains(&f.library_path))
         .count();
 
     let per_library = compute_per_library(
-        &healthy,
-        &new,
+        &healthy_by_library,
+        &new_by_library,
         &leftover,
         &stale,
         &conflicts,
-        &new_destinations,
+        &replaced_destinations,
     );
 
     Ok(DeployModalData {
-        healthy,
-        new,
+        healthy_count,
+        healthy_by_library,
+        new_count,
+        new_by_library,
         new_by_dir,
         conflicts,
         leftover,
@@ -572,6 +569,28 @@ fn load_deploy_sidecars(
             }
         })
         .collect()
+}
+
+/// Wrap SQL-side `(directory, count)` pairs in the display aggregate shape.
+///
+/// Mirrors `aggregate_by_directory`'s output ordering (count desc) so both
+/// paths render identically.
+fn to_directory_aggregates(
+    counts: Vec<(String, usize)>,
+) -> Vec<mm_meta::views::cluster_deploy::DirectoryAggregate> {
+    use mm_meta::views::cluster_deploy::DirectoryAggregate;
+
+    let mut aggregates: Vec<_> = counts
+        .into_iter()
+        .map(|(directory, count)| DirectoryAggregate {
+            directory,
+            count,
+            sidecar_count: 0,
+        })
+        .collect();
+
+    aggregates.sort_by(|a, b| b.count.cmp(&a.count));
+    aggregates
 }
 
 fn aggregate_by_directory<'a>(
@@ -638,43 +657,43 @@ fn merge_sidecar_counts(
 }
 
 fn compute_per_library(
-    healthy: &[crate::meta::views::DeploySignalFile],
-    new: &[crate::meta::views::DeploySignalFile],
+    healthy_by_library: &[(String, usize)],
+    new_by_library: &[(String, usize)],
     leftover: &[crate::meta::views::LeftoverSignalFile],
     stale: &[crate::meta::views::StaleSignalFile],
     _conflicts: &[crate::meta::views::ConflictGroup],
-    new_destinations: &HashSet<String>,
+    replaced_destinations: &HashSet<String>,
 ) -> Vec<mm_meta::views::cluster_deploy::LibrarySummary> {
     use mm_meta::views::cluster_deploy::LibrarySummary;
 
     let mut libs: HashMap<String, LibrarySummary> = HashMap::new();
 
-    for f in healthy {
+    for (lib_name, count) in healthy_by_library {
         let entry = libs
-            .entry(f.library_name.clone())
+            .entry(lib_name.clone())
             .or_insert_with(|| LibrarySummary {
-                library_name: f.library_name.clone(),
+                library_name: lib_name.clone(),
                 healthy_count: 0,
                 new_count: 0,
                 leftover_count: 0,
                 stale_count: 0,
                 replaced_count: 0,
             });
-        entry.healthy_count += 1;
+        entry.healthy_count += *count;
     }
-    for f in new {
-        if !f.library_name.is_empty() {
+    for (lib_name, count) in new_by_library {
+        if !lib_name.is_empty() {
             let entry = libs
-                .entry(f.library_name.clone())
+                .entry(lib_name.clone())
                 .or_insert_with(|| LibrarySummary {
-                    library_name: f.library_name.clone(),
+                    library_name: lib_name.clone(),
                     healthy_count: 0,
                     new_count: 0,
                     leftover_count: 0,
                     stale_count: 0,
                     replaced_count: 0,
                 });
-            entry.new_count += 1;
+            entry.new_count += *count;
         }
     }
     for f in leftover {
@@ -689,7 +708,7 @@ fn compute_per_library(
                 replaced_count: 0,
             });
         entry.leftover_count += 1;
-        if new_destinations.contains(&f.library_path) {
+        if replaced_destinations.contains(&f.library_path) {
             entry.replaced_count += 1;
         }
     }

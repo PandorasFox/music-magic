@@ -131,6 +131,14 @@ impl SignalWriteSender {
     ///
     /// Used for bulk clear-then-write patterns where an entire pipeline
     /// re-emits all signals from scratch.
+    /// Apply every outstanding same-zone relocation and clear those signals.
+    ///
+    /// One op for the whole set — see `DbWriteOp::ApplyAllMovedFilePaths`.
+    pub fn apply_all_moved_file_paths(&self, _witness: &MutationExecutionWitness) {
+        self.mark_enqueued();
+        let _ = self.tx.send(DbWriteOp::ApplyAllMovedFilePaths);
+    }
+
     pub fn clear_signal_table<S: crate::meta::signals::store::CorpusSignalStore>(
         &self,
         _witness: &impl SignalWitness,

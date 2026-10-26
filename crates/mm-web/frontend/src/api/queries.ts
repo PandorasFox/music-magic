@@ -16,8 +16,8 @@ import type {
   ArtistNeedsPluralModalData,
   SubparDuplicateModalData,
   LosslessRemuxModalData,
-  MovedFileInfo,
-  OobFile,
+  MovedFileSummary,
+  OobSummary,
   PackingKnotData,
   DirectoryClusterModalData,
   VaOverrideReview,
@@ -54,7 +54,7 @@ export const queryKeys = {
   subparDupes: ["subpar-duplicate-data"] as const,
   losslessRemux: ["lossless-remux-data"] as const,
   movedFiles: ["moved-files"] as const,
-  oobFiles: (bucket: string) => ["oob-files", bucket] as const,
+  oobSummary: (bucket: string) => ["oob-summary", bucket] as const,
   directoryClusters: ["directory-cluster-data"] as const,
   releaseOverlaps: ["release-overlap-data"] as const,
   vaOverrideReview: ["va-override-review"] as const,
@@ -172,14 +172,17 @@ export function useLosslessRemuxData() {
 export function useMovedFiles() {
   return useQuery({
     queryKey: queryKeys.movedFiles,
-    queryFn: () => get<MovedFileInfo[]>("/queries/moved-files"),
+    queryFn: () => get<MovedFileSummary>("/queries/moved-files"),
   });
 }
 
-export function useOobFiles(bucket: string) {
+// Bucket totals plus one bounded page. The OOB tables run to hundreds of
+// thousands of rows during a bulk tag rewrite, so the page is capped
+// server-side and `counts` carries the real totals.
+export function useOobSummary(bucket: string) {
   return useQuery({
-    queryKey: queryKeys.oobFiles(bucket),
-    queryFn: () => get<OobFile[]>(`/queries/oob-files?bucket=${bucket}`),
+    queryKey: queryKeys.oobSummary(bucket),
+    queryFn: () => get<OobSummary>(`/queries/oob-summary?bucket=${bucket}`),
   });
 }
 

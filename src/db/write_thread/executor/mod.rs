@@ -279,6 +279,47 @@ pub(super) fn execute_signal_op(db: &Database, op: &DbWriteOp) {
             }
         }
 
+        DbWriteOp::ApplyAllMovedFilePaths => {
+            // Same-zone relocations only: the correlated subquery rewrites
+            // each inode's stored path to the one the walker observed.
+            // Cross-zone moves need tag-table migration, so they are left in
+            // place for the per-file UpdateFilePath path to handle.
+            let applied = db.conn().execute(
+                "UPDATE inode_paths SET path = ( \
+                     SELECT m.path FROM signal_moved_file m \
+                     WHERE m.inode = inode_paths.inode AND m.old_zone = m.new_zone \
+                       AND m.old_zone = inode_paths.zone) \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM signal_moved_file m \
+                     WHERE m.inode = inode_paths.inode AND m.old_zone = m.new_zone \
+                       AND m.old_zone = inode_paths.zone)",
+                [],
+            );
+
+            match applied {
+                Ok(count) => {
+                    let cleared = db.conn().execute(
+                        "DELETE FROM signal_moved_file WHERE old_zone = new_zone",
+                        [],
+                    );
+                    match cleared {
+                        Ok(n) => crate::logging::log_general(format!(
+                            "[DB_THREAD] ApplyAllMovedFilePaths: {} paths updated, {} signals cleared",
+                            count, n
+                        )),
+                        Err(e) => crate::logging::log_error(format!(
+                            "[DB_THREAD] ApplyAllMovedFilePaths: paths updated but signal clear failed: {}",
+                            e
+                        )),
+                    }
+                }
+                Err(e) => crate::logging::log_error(format!(
+                    "[DB_THREAD] ApplyAllMovedFilePaths failed: {}",
+                    e
+                )),
+            }
+        }
+
         DbWriteOp::ClearSignalTable { clear_fn, label } => {
             match clear_fn(db.conn()) {
                 Ok(count) => {

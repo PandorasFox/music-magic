@@ -31,10 +31,13 @@ pub struct SidecarSummary<'a> {
 /// Information about a deploy signal for display in the info pane.
 #[derive(Debug, Clone, Default)]
 pub enum SignalInfo<'a> {
-    /// Healthy file: corpus path and library path match.
-    Healthy {
-        corpus_path: &'a str,
-        library_path: &'a str,
+    /// Healthy summary: per-library counts of correctly-deployed files.
+    ///
+    /// Healthy files aren't actionable, so the info pane shows aggregate
+    /// counts rather than any individual entry.
+    HealthySummary {
+        totals: &'a [(String, usize)],
+        total: usize,
     },
     /// New files ready to deploy: aggregated by directory.
     NewDirectory {
@@ -91,7 +94,7 @@ impl<'a> SignalInfoPane<'a> {
 
     fn title(&self) -> &'static str {
         match self.active_tab {
-            DeployTab::Healthy => "Healthy File Info",
+            DeployTab::Healthy => "Healthy Summary",
             DeployTab::New => "New Directory Info",
             DeployTab::Conflicts => "Conflict Info",
             DeployTab::Leftover => "Leftover Directory Info",
@@ -102,10 +105,9 @@ impl<'a> SignalInfoPane<'a> {
     fn build_content(&self, width: u16) -> Vec<Line<'a>> {
         match self.info {
             SignalInfo::None => self.no_selection_content(),
-            SignalInfo::Healthy {
-                corpus_path,
-                library_path,
-            } => self.healthy_content(corpus_path, library_path, width),
+            SignalInfo::HealthySummary { totals, total } => {
+                self.healthy_summary_content(totals, *total)
+            }
             SignalInfo::NewDirectory {
                 directory,
                 file_count,
@@ -141,35 +143,73 @@ impl<'a> SignalInfoPane<'a> {
         ]
     }
 
-    fn healthy_content(&self, corpus_path: &str, library_path: &str, width: u16) -> Vec<Line<'a>> {
+    fn healthy_summary_content(
+        &self,
+        totals: &[(String, usize)],
+        total: usize,
+    ) -> Vec<Line<'a>> {
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "Deployed correctly",
+                    "All deployed correctly",
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "Corpus Path:",
+            Line::from(vec![
+                Span::styled(
+                    format!("{}", total),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if total == 1 {
+                        " file across "
+                    } else {
+                        " files across "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{}", totals.len()),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    if totals.len() == 1 { " library" } else { " libraries" },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+
+        if totals.len() > 1 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Per-library:",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            )),
-        ];
-        lines.extend(path_lines(corpus_path, Style::default(), width));
+            )));
+            for (name, count) in totals {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", name), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{}", count),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]));
+            }
+        }
+
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Library Path:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            "Nothing to do here — healthy files are informational.",
+            Style::default().fg(Color::DarkGray),
         )));
-        lines.extend(path_lines(library_path, Style::default(), width));
         lines
     }
 
